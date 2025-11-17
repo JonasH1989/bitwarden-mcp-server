@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  bitwarden-mcp-server:
+    build: .
+    container_name: bitwarden-mcp-server
+    ports:
+      - "8007:8007"
+    env_file:
+      - .env
+    environment:
+      - BITWARDEN_BASE_URL=${BITWARDEN_BASE_URL}
+      - BITWARDEN_EMAIL=${BITWARDEN_EMAIL}
+      - BITWARDEN_PASSWORD=${BITWARDEN_PASSWORD}
+      - BITWARDEN_CLIENT_ID=${BITWARDEN_CLIENT_ID:-bitwarden-mcp-server}
+      - BITWARDEN_CLIENT_SECRET=${BITWARDEN_CLIENT_SECRET:-bitwarden-mcp-secret}
+    restart: unless-stopped
+    networks:
+      - default
+#      - llm-rag-mcp_backend
+
+#networks:
+#  llm-rag-mcp_backend:
+#    external: true
