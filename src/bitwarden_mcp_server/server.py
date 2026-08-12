@@ -495,6 +495,9 @@ def main() -> None:
     mcp.settings.host = os.getenv("SERVER_HOST", "0.0.0.0")
     mcp.settings.port = int(os.getenv("SERVER_PORT", "8007"))
     mcp.settings.stateless_http = True  # Enable stateless mode
+
+    # Fix: akzeptiere alle Host-Header (sonst 421 Misdirected Request)
+    mcp.settings.trusted_hosts = ["*"]
     
     # Run with streamable HTTP transport
     mcp.run(transport="streamable-http")
