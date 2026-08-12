@@ -491,20 +491,33 @@ def main() -> None:
     # Load environment variables
     load_dotenv()
     
+    # Fix Pydantic `lifespan` forward-reference (sonst Settings-Auflösung kaputt)
+    try:
+        from mcp.server.fastmcp.settings import Settings
+        Settings.model_rebuild()
+    except Exception:
+        pass
+    
     # Configure FastMCP settings for streamable HTTP transport
     mcp.settings.host = os.getenv("SERVER_HOST", "0.0.0.0")
     mcp.settings.port = int(os.getenv("SERVER_PORT", "8007"))
     mcp.settings.stateless_http = True  # Enable stateless mode
-
-    # Fix: akzeptiere alle Host-Header (sonst 421 Misdirected Request).
-    # `mcp.settings.trusted_hosts` existiert in dieser FastMCP-Version nicht als
-    # Pydantic-Feld. Daher direkt die Starlette-App um TrustedHostMiddleware
-    # erweitern und manuell mit uvicorn starten.
-    from starlette.middleware.trustedhost import TrustedHostMiddleware
-    app = mcp.streamable_http_app()
-    app.add_middleware(TrustedHostMiddleware, trusted_hosts=["*"])
     
-    # Run with uvicorn directly (statt mcp.run, damit Middleware greift)
+    # Erstelle die ASGI-App und konfiguriere TrustedHostMiddleware korrekt.
+    # In Starlette heißt der Parameter `allowed_hosts` (nicht `trusted_hosts`).
+    # Wir entfernen die bestehende TrustedHostMiddleware (falls von FastMCP hinzugefügt)
+    # und fügen eine neue hinzu, die ALLE Hosts akzeptiert.
+    app = mcp.streamable_http_app()
+    from starlette.middleware.trustedhost import TrustedHostMiddleware
+    # Entferne existierende TrustedHostMiddleware-Instanzen
+    app.user_middleware = [
+        m for m in app.user_middleware
+        if 'TrustedHostMiddleware' not in str(m)
+    ]
+    # Füge neue TrustedHostMiddleware hinzu (allowed_hosts=["*"] akzeptiert alles)
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*"])
+    
+    # Run with uvicorn directly (statt mcp.run, damit unsere Middleware greift)
     import uvicorn
     uvicorn.run(app, host=mcp.settings.host, port=mcp.settings.port)
 
