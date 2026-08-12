@@ -506,6 +506,19 @@ def main() -> None:
     # Erstelle die ASGI-App
     app = mcp.streamable_http_app()
     
+    # Health-Check-Endpoint hinzufügen (GET /health → 200 OK).
+    # Wird von Coolify als Health-Check-Pfad genutzt.
+    from starlette.responses import JSONResponse
+    async def health_endpoint(request):
+        """Health-Check-Endpoint für Coolify/Monitoring."""
+        return JSONResponse({
+            "status": "healthy",
+            "server": "Bitwarden MCP Server",
+            "version": "1.29.0"
+        })
+    app.add_route("/health", health_endpoint, methods=["GET"])
+    logger.info("Health-Check-Endpoint registriert: GET /health")
+    
     # Fix: TrustedHostMiddleware lehnt alle Hosts ab → 421. Umgehe das,
     # indem ich den Host-Header im ASGI-Scope auf "localhost" setze
     # BEVOR irgendeine Middleware ihn sieht. Das ist robuster als
