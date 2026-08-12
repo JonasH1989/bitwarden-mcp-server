@@ -503,23 +503,34 @@ def main() -> None:
     mcp.settings.port = int(os.getenv("SERVER_PORT", "8007"))
     mcp.settings.stateless_http = True  # Enable stateless mode
     
-    # Erstelle die ASGI-App und konfiguriere TrustedHostMiddleware korrekt.
-    # In Starlette heißt der Parameter `allowed_hosts` (nicht `trusted_hosts`).
-    # Wir entfernen die bestehende TrustedHostMiddleware (falls von FastMCP hinzugefügt)
-    # und fügen eine neue hinzu, die ALLE Hosts akzeptiert.
+    # Erstelle die ASGI-App
     app = mcp.streamable_http_app()
-    from starlette.middleware.trustedhost import TrustedHostMiddleware
-    # Entferne existierende TrustedHostMiddleware-Instanzen
-    app.user_middleware = [
-        m for m in app.user_middleware
-        if 'TrustedHostMiddleware' not in str(m)
-    ]
-    # Füge neue TrustedHostMiddleware hinzu (allowed_hosts=["*"] akzeptiert alles)
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*"])
     
-    # Run with uvicorn directly (statt mcp.run, damit unsere Middleware greift)
+    # Fix: TrustedHostMiddleware lehnt alle Hosts ab → 421. Umgehe das,
+    # indem ich den Host-Header im ASGI-Scope auf "localhost" setze
+    # BEVOR irgendeine Middleware ihn sieht. Das ist robuster als
+    # user_middleware zu manipulieren (was in v3 nicht funktioniert hat).
+    class HostOverrideASGI:
+        """Override den Host-Header im ASGI-Scope auf 'localhost'."""
+        def __init__(self, inner_app):
+            self.inner_app = inner_app
+        async def __call__(self, scope, receive, send):
+            if scope["type"] in ("http", "websocket") and "headers" in scope:
+                new_headers = []
+                for name, value in scope["headers"]:
+                    if name == b"host":
+                        # Ersetze Host mit "localhost:PORT" (was die Middleware erlaubt)
+                        value = f"localhost:{mcp.settings.port}".encode()
+                    new_headers.append((name, value))
+                scope["headers"] = new_headers
+            await self.inner_app(scope, receive, send)
+    
+    # Wrap die App
+    wrapped_app = HostOverrideASGI(app)
+    
+    # Run with uvicorn directly
     import uvicorn
-    uvicorn.run(app, host=mcp.settings.host, port=mcp.settings.port)
+    uvicorn.run(wrapped_app, host=mcp.settings.host, port=mcp.settings.port)
 
 
 # Export the Starlette/FastAPI app for testing and external use
