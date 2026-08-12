@@ -496,11 +496,17 @@ def main() -> None:
     mcp.settings.port = int(os.getenv("SERVER_PORT", "8007"))
     mcp.settings.stateless_http = True  # Enable stateless mode
 
-    # Fix: akzeptiere alle Host-Header (sonst 421 Misdirected Request)
-    mcp.settings.trusted_hosts = ["*"]
+    # Fix: akzeptiere alle Host-Header (sonst 421 Misdirected Request).
+    # `mcp.settings.trusted_hosts` existiert in dieser FastMCP-Version nicht als
+    # Pydantic-Feld. Daher direkt die Starlette-App um TrustedHostMiddleware
+    # erweitern und manuell mit uvicorn starten.
+    from starlette.middleware.trustedhost import TrustedHostMiddleware
+    app = mcp.streamable_http_app()
+    app.add_middleware(TrustedHostMiddleware, trusted_hosts=["*"])
     
-    # Run with streamable HTTP transport
-    mcp.run(transport="streamable-http")
+    # Run with uvicorn directly (statt mcp.run, damit Middleware greift)
+    import uvicorn
+    uvicorn.run(app, host=mcp.settings.host, port=mcp.settings.port)
 
 
 # Export the Starlette/FastAPI app for testing and external use
