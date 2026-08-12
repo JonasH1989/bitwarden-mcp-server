@@ -57,3 +57,18 @@ cp env.example .env
 docker compose up -d
 ```
 
+
+## Patched Image (JonasH1989 fork)
+
+Dieser Fork fixt den `Invalid Host header` (HTTP 421) Bug aus dem Original-Image.
+
+**Verwendung:**
+```bash
+docker run -p 8007:8007 \
+  -e BITWARDEN_BASE_URL=https://vw.hillmanns.eu \
+  -e BITWARDEN_EMAIL=... \
+  -e BITWARDEN_PASSWORD=... \
+  ghcr.io/jonash1989/bitwarden-mcp-server:latest
+```
+
+**GitHub Container Registry:** `ghcr.io/jonash1989/bitwarden-mcp-server`
