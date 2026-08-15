@@ -148,9 +148,29 @@ class BitwardenCLIClient:
             child.expect(pexpect.EOF)
             output = child.before.decode('utf-8')
             child.close()
-            
+
+            # DIAGNOSE-PATCH (2026-08-15): rohen bw-Output IMMER loggen, damit
+            # wir beim nächsten Test exakt sehen, was bw geantwortet hat.
+            # Vorher: output wurde bei > 10 Zeichen als Session-Key interpretiert
+            # → bw-Fehlermeldungen wie "Email or password is incorrect" (35 chars)
+            #   wurden fälschlich als erfolgreicher Login geloggt.
+            logger.info(f"bw login raw output (first 500 chars): {output[:500]!r}")
+
             # Check if we got a session key
             if output and len(output.strip()) > 10:
+                # NEU: auf bekannte bw-Fehler prüfen, BEVOR als Session-Key interpretiert.
+                # Damit verschlucken wir keine bw-Fehlermeldungen mehr als "Success".
+                error_indicators = [
+                    "incorrect", "invalid", "error", "fail", "denied",
+                    "not found", "two-step", "verification", "not logged in",
+                    "you must", "unable", "cannot", "unexpected",
+                ]
+                if any(ind in output.lower() for ind in error_indicators):
+                    logger.error(
+                        f"bw login FAILED (recognized error indicator in output). "
+                        f"Output: {output!r}"
+                    )
+                    return False
                 self.session_key = output.strip()
                 logger.info("Successfully authenticated with Bitwarden")
                 return True
