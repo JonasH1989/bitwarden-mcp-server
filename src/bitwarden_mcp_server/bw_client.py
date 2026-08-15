@@ -497,10 +497,11 @@ class BitwardenCLIClient:
                         hashmod=SHA256,
                         context=b"bitwarden-master-password-auth-v2",
                     )
-                    # v1: PBKDF2(stretched, email.lower(), 1) — old style
+                    # v1: PBKDF2(stretched, self.user_email.lower(), 1) — old style
+                    # (self.user_email statt email, da email im Scope von _decrypt_user_key nicht verfügbar)
                     master_key_v1 = PBKDF2(
                         stretched,
-                        email.lower().encode("utf-8"),
+                        self.user_email.lower().encode("utf-8"),
                         dkLen=32,
                         count=1,
                         hmac_hash_module=SHA256,
