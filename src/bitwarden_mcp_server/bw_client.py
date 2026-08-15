@@ -205,26 +205,27 @@ class BitwardenCLIClient:
                     folder_id: str = None, limit: int = 20) -> List[BitwardenItem]:
         """Search items by query, type, folder.
 
-        Vaultwarden's REST API doesn't support server-side full-text search.
-        We fetch all items via /api/items, then filter locally.
+        Vaultwarden returns all items via /api/sync (not /api/items).
+        We fetch the full sync response, then filter the items array locally.
         """
         if not self._ensure_logged_in():
             logger.error("search_items: not authenticated")
             return []
 
         try:
-            resp = self._request("GET", "/api/items", timeout=30)
-            self._log_response("GET /api/items", resp)
+            # Vaultwarden's /api/sync returns profile + folders + items + collections + ...
+            # There is NO /api/items list endpoint (404), so we use /api/sync.
+            resp = self._request("GET", "/api/sync", timeout=30)
+            self._log_response("GET /api/sync", resp)
             if resp.status_code != 200:
-                logger.error(f"GET /api/items failed: {resp.status_code}")
+                logger.error(f"GET /api/sync failed: {resp.status_code}")
                 return []
 
             data = resp.json()
-            # Vaultwarden may wrap items in {"data": [...]} or return a list directly
-            if isinstance(data, dict):
-                items_data = data.get("data", data.get("items", []))
-            else:
-                items_data = data
+            items_data = data.get("items", [])
+            if not isinstance(items_data, list):
+                logger.error(f"Unexpected items format in /api/sync: {type(items_data)}")
+                return []
 
             target_type = self.TYPE_MAP.get(item_type.lower()) if item_type else None
             query_lower = query.lower() if query else None
@@ -373,18 +374,22 @@ class BitwardenCLIClient:
     # ----- Folder operations -----
 
     def list_folders(self) -> List[Dict[str, Any]]:
-        """List all folders."""
+        """List all folders.
+
+        Like items, folders are also fetched via /api/sync (no /api/folders list endpoint).
+        """
         if not self._ensure_logged_in():
             return []
         try:
-            resp = self._request("GET", "/api/folders", timeout=30)
-            self._log_response("GET /api/folders", resp)
+            resp = self._request("GET", "/api/sync", timeout=30)
+            self._log_response("GET /api/sync (folders)", resp)
             if resp.status_code != 200:
                 return []
             data = resp.json()
-            if isinstance(data, dict):
-                return data.get("data", data.get("folders", []))
-            return data
+            folders = data.get("folders", [])
+            if not isinstance(folders, list):
+                return []
+            return folders
         except Exception as e:
             logger.error(f"list_folders error: {e}")
             return []
