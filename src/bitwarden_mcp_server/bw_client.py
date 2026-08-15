@@ -417,11 +417,14 @@ class BitwardenCLIClient:
         """
         # Diagnostic: log format of masterPasswordUnlock (no secret content!)
         if master_password_unlock:
-            logger.info(
-                f"masterPasswordUnlock format: starts={master_password_unlock[:6]!r} "
-                f"len={len(master_password_unlock)} "
-                f"version={master_password_unlock.split(".")[0] if "." in master_password_unlock else "?"!r}"
-            )
+            # Diagnostic: log format of masterPasswordUnlock (no secret content!)
+            if master_password_unlock:
+                mpu_starts = master_password_unlock[:6]
+                mpu_version = master_password_unlock.split('.')[0] if '.' in master_password_unlock else '?'
+                logger.info(
+                    f"masterPasswordUnlock format: starts={mpu_starts!r} "
+                    f"len={len(master_password_unlock)} version={mpu_version!r}"
+                )
         plaintext = self._decrypt_enc_string(master_password_unlock, master_key)
         if not plaintext:
             logger.warning(
