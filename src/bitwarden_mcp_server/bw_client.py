@@ -451,13 +451,29 @@ class BitwardenCLIClient:
                     logger.error("Missing salt, enc_user_key, or master_key")
                     return None
                 try:
-                    # Decode salt (it's base64-encoded in the new Bitwarden format)
-                    try:
-                        salt_bytes = base64.b64decode(salt) if isinstance(salt, str) else salt
-                    except Exception as e:
-                        logger.error(f"Failed to base64-decode salt: {e}")
-                        return None
-                    logger.info(f"Salt decoded: {len(salt_bytes)} bytes (from {len(str(salt))} base64 chars)")
+                    # Decode salt — try base64 first, fall back to raw bytes
+                    # The salt field in new Bitwarden format may be:
+                    #  - base64-encoded (standard)
+                    #  - raw bytes (some Vaultwarden versions)
+                    #  - hex-encoded
+                    salt_raw = salt if isinstance(salt, str) else str(salt)
+                    salt_bytes = None
+                    if isinstance(salt_raw, bytes):
+                        salt_bytes = salt_raw
+                        logger.info(f"Salt is bytes (len={len(salt_bytes)})")
+                    else:
+                        # Try base64 first (with padding fix)
+                        try:
+                            # Add padding if missing (base64 requires len % 4 == 0)
+                            padded = salt_raw + "=" * (-len(salt_raw) % 4)
+                            salt_bytes = base64.b64decode(padded, validate=False)
+                            logger.info(f"Salt base64-decoded: {len(salt_bytes)} bytes (from {len(salt_raw)} chars)")
+                        except Exception as e:
+                            # Fall back to raw bytes
+                            salt_bytes = salt_raw.encode("utf-8") if isinstance(salt_raw, str) else salt_raw
+                            logger.warning(
+                                f"base64 decode failed ({e}), using raw salt as bytes: {len(salt_bytes)} bytes"
+                            )
 
                     # v2: HKDF with auth-v2 info
                     password_hash = PBKDF2(
