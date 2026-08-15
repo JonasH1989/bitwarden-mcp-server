@@ -280,7 +280,7 @@ class BitwardenCLIClient:
         if not self._ensure_logged_in():
             return None
         try:
-            resp = self._request("GET", f"/api/items/{item_id}", timeout=30)
+            resp = self._request("GET", f"/api/ciphers/{item_id}", timeout=30)
             self._log_response(f"GET /api/items/{item_id}", resp)
             if resp.status_code != 200:
                 logger.error(f"GET /api/items/{item_id} failed: {resp.status_code}")
@@ -293,10 +293,13 @@ class BitwardenCLIClient:
     def create_login(self, name: str, username: str, password: str,
                     uris: List[str] = None, notes: str = None,
                     folder_id: str = None) -> Optional[str]:
-        """Create a new login item. Returns new item ID or None."""
+        """Create a new login cipher. Returns new cipher ID or None.
+
+        Note: Vaultwarden uses /api/ciphers for item operations, NOT /api/items.
+        """
         if not self._ensure_logged_in():
             return None
-        item_template = {
+        cipher_template = {
             "type": 1,  # Login
             "name": name,
             "login": {
@@ -307,10 +310,11 @@ class BitwardenCLIClient:
             "notes": notes or "",
         }
         if folder_id:
-            item_template["folderId"] = folder_id
+            cipher_template["folderId"] = folder_id
         try:
-            resp = self._request("POST", "/api/items", json=item_template, timeout=30)
-            self._log_response("POST /api/items", resp)
+            # POST /api/ciphers (not /api/items!)
+            resp = self._request("POST", "/api/ciphers", json=cipher_template, timeout=30)
+            self._log_response("POST /api/ciphers", resp)
             if resp.status_code in (200, 201):
                 return resp.json().get("id")
             logger.error(f"create_login failed: {resp.status_code} {resp.text[:200]!r}")
@@ -323,14 +327,14 @@ class BitwardenCLIClient:
         """Create a new secure note. Returns new item ID or None."""
         if not self._ensure_logged_in():
             return None
-        item_template = {
+        cipher_template = {
             "type": 2,  # SecureNote
             "name": name,
             "secureNote": {"type": 0},  # Generic
             "notes": content,
         }
         if folder_id:
-            item_template["folderId"] = folder_id
+            cipher_template["folderId"] = folder_id
         try:
             resp = self._request("POST", "/api/items", json=item_template, timeout=30)
             self._log_response("POST /api/items", resp)
@@ -364,7 +368,7 @@ class BitwardenCLIClient:
             current.folder_id = kwargs["folder_id"]
         try:
             item_data = self._item_to_dict(current)
-            resp = self._request("PUT", f"/api/items/{item_id}", json=item_data, timeout=30)
+            resp = self._request("PUT", f"/api/ciphers/{item_id}", json=item_data, timeout=30)
             self._log_response(f"PUT /api/items/{item_id}", resp)
             return resp.status_code in (200, 204)
         except Exception as e:
@@ -376,7 +380,7 @@ class BitwardenCLIClient:
         if not self._ensure_logged_in():
             return False
         try:
-            resp = self._request("DELETE", f"/api/items/{item_id}", timeout=30)
+            resp = self._request("DELETE", f"/api/ciphers/{item_id}", timeout=30)
             self._log_response(f"DELETE /api/items/{item_id}", resp)
             return resp.status_code in (200, 204)
         except Exception as e:
