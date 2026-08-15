@@ -435,9 +435,11 @@ class BitwardenCLIClient:
         try:
             raw = plaintext.encode("latin-1") if isinstance(plaintext, str) else plaintext
             # Diagnostic: log decrypted plaintext length (expected 64 for user_key)
+            # Diagnostic: log decrypted plaintext length (expected 64 for user_key)
+            first_bytes = raw[:4].hex() if len(raw) >= 4 else 'too short'
             logger.info(
                 f"Decrypted user_key: raw_len={len(raw)} expected=64 "
-                f"first_bytes={raw[:4].hex() if len(raw) >= 4 else "too short"!r}"
+                f"first_bytes={first_bytes!r}"
             )
             if len(raw) >= 32:
                 # Bitwarden user_key layout: [encKey 32B][macKey 32B] = 64B total
