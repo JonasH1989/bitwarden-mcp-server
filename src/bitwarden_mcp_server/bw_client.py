@@ -169,6 +169,63 @@ class BitwardenCLIClient:
             return False
 
         logger.info("OAuth2 authentication successful — access_token set")
+
+        # === Step 2: Derive user encryption key from master password ===
+        # Get KDF iterations via /identity/accounts/prelogin
+        email_from_token = token_data.get("email", "")
+        try:
+            prelogin_resp = self.session.post(
+                f"{self.base_url}/identity/accounts/prelogin",
+                json={"email": email_from_token},
+                timeout=10
+            )
+            if prelogin_resp.status_code == 200:
+                kdf_iterations = prelogin_resp.json().get("kdfIterations", 600000)
+            else:
+                logger.warning(f"prelogin failed ({prelogin_resp.status_code}), using default 600000")
+                kdf_iterations = 600000
+        except Exception as e:
+            logger.warning(f"prelogin error: {e}, using default 600000")
+            kdf_iterations = 600000
+
+        # Get email + encrypted user key from /api/sync
+        try:
+            sync_resp = self._request("GET", "/api/sync", timeout=30)
+            if sync_resp.status_code == 200:
+                sync_data = sync_resp.json()
+                profile = sync_data.get("profile", {})
+                email = profile.get("email", email_from_token)
+                self.user_email = email
+                master_pw_unlock = (
+                    sync_data.get("userDecryption", {}).get("masterPasswordUnlock")
+                )
+                if master_pw_unlock and email:
+                    master_password = os.getenv("BITWARDEN_PASSWORD", "")
+                    if master_password:
+                        try:
+                            master_key = self._derive_master_key(
+                                master_password, email, kdf_iterations
+                            )
+                            self.user_key = self._decrypt_user_key(
+                                master_pw_unlock, master_key
+                            )
+                            if self.user_key:
+                                logger.info(
+                                    f"User key derived and decrypted "
+                                    f"(email={email}, kdf_iter={kdf_iterations})"
+                                )
+                            else:
+                                logger.error("Failed to decrypt user key")
+                        except Exception as e:
+                            logger.error(f"Key derivation error: {e}")
+                    else:
+                        logger.warning(
+                            "BITWARDEN_PASSWORD env var not set — "
+                            "ciphers cannot be decrypted"
+                        )
+        except Exception as e:
+            logger.warning(f"/api/sync for key derivation failed: {e}")
+
         return True
 
     def logout(self) -> bool:
@@ -422,16 +479,23 @@ class BitwardenCLIClient:
             return []
 
     def get_item(self, item_id: str) -> Optional[BitwardenItem]:
-        """Get a specific item by ID."""
+        """Get a specific item by ID. Decrypts if user_key is available."""
         if not self._ensure_logged_in():
             return None
         try:
             resp = self._request("GET", f"/api/ciphers/{item_id}", timeout=30)
-            self._log_response(f"GET /api/items/{item_id}", resp)
+            self._log_response(f"GET /api/ciphers/{item_id}", resp)
             if resp.status_code != 200:
-                logger.error(f"GET /api/items/{item_id} failed: {resp.status_code}")
+                logger.error(f"GET /api/ciphers/{item_id} failed: {resp.status_code}")
                 return None
-            return self._parse_item(resp.json())
+            data = resp.json()
+            # Decrypt if user_key available
+            if self.user_key:
+                try:
+                    data = self._decrypt_cipher(data, self.user_key)
+                except Exception as e:
+                    logger.warning(f"Decrypt failed: {e}")
+            return self._parse_item(data)
         except Exception as e:
             logger.error(f"get_item error: {e}")
             return None
