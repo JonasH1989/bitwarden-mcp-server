@@ -120,11 +120,17 @@ class BitwardenCLIClient:
             raise Exception(f"bw command failed: {str(e)}")
     
     def authenticate(self) -> bool:
-        """Authenticate with Bitwarden/Vaultwarden via bw login --apikey (OAuth2 Client-Credentials).
+        """OAuth2 Client-Credentials Login via bw login --apikey *** Master-Pwd unlock).
 
-        bw 2026.2.0 mit --apikey erwartet zwei interaktive Prompts:
-          1. "? client_id: "     → wir senden den User-API-Key (aus BITWARDEN_CLIENT_ID)
-          2. "? client_secret: " → wir senden das Client-Secret (aus BITWARDEN_CLIENT_SECRET)
+        bw 2026.2.0 mit --apikey *** verschiedene Verhaltensweisen:
+          a) Vaultwarden kennt das Secret → nur "client_id:" Prompt, dann
+             direkt "You are logged in!" (kein client_secret Prompt)
+          b) Vaultwarden kennt das Secret nicht → fragt nach "client_secret:"
+
+        Wir behandeln beide Flows. Nach erfolgreichem Login:
+          - bw ist eingeloggt, aber Vault ist locked
+          - Wir rufen `bw unlock` auf mit self.password (falls vorhanden)
+          - Session-Key wird in self.session_key gespeichert für --session
 
         Umgeht komplett:
         - Master-Pwd-Flow (kein PBKDF2, keine 2FA)
@@ -145,7 +151,6 @@ class BitwardenCLIClient:
             self._run_bw_command(['config', 'server', self.base_url])
 
             # OAuth2 Client-Credentials Login via bw login --apikey *** Master-Pwd, kein 2FA).
-            # bw fragt interaktiv nach "client_id:" und "client_secret:" (NICHT "API key:").
             logger.debug("Starting interactive apikey login with pexpect")
             child = pexpect.spawn(
                 'env',
@@ -154,37 +159,86 @@ class BitwardenCLIClient:
             )
             child.expect('client_id:')
             child.sendline(self.api_key)
-            child.expect('client_secret:')
-            child.sendline(self.client_secret)
 
-            # Wait for completion and get output
-            child.expect(pexpect.EOF)
-            output = child.before.decode('utf-8')
-            child.close()
+            # Nächster Prompt ist entweder client_secret (Vaultwarden kennt Secret nicht)
+            # ODER direkt "You are logged in!" (Vaultwarden kennt Secret)
+            # ODER EOF bei unerwartetem Fehler
+            idx = child.expect(
+                ['client_secret:', 'You are logged in', pexpect.EOF],
+                timeout=30
+            )
+            if idx == 0:
+                # bw fragt nach client_secret - senden
+                child.sendline(self.client_secret)
+                child.expect(pexpect.EOF, timeout=30)
 
-            # DIAGNOSE-PATCH (2026-08-15): rohen bw-Output IMMER loggen, damit
-            # wir beim nächsten Test exakt sehen, was bw geantwortet hat.
+            # Output capture (VOR close)
+            output = child.before.decode('utf-8') if child.before else ''
+            try:
+                child.close()
+            except:
+                pass
+
+            # DIAGNOSE-PATCH: rohen bw-Output loggen
             logger.info(f"bw apikey login raw output (first 500 chars): {output[:500]!r}")
 
-            # Check if we got a session key
-            if output and len(output.strip()) > 10:
-                # NEU: auf bekannte bw-Fehler prüfen, BEVOR als Session-Key interpretiert.
-                error_indicators = [
-                    "incorrect", "invalid", "error", "fail", "denied",
-                    "not found", "two-step", "verification", "not logged in",
-                    "you must", "unable", "cannot", "unexpected",
-                ]
-                if any(ind in output.lower() for ind in error_indicators):
-                    logger.error(
-                        f"bw apikey login FAILED (recognized error indicator). "
-                        f"Output: {output!r}"
-                    )
-                    return False
-                self.session_key = output.strip()
-                logger.info("Successfully authenticated via API key (bw login --apikey)")
+            # Check for known error indicators
+            error_indicators = [
+                "incorrect", "invalid", "error", "fail", "denied",
+                "not found", "two-step", "verification", "not logged in",
+                "you must", "unable", "cannot", "unexpected",
+            ]
+            if output and any(ind in output.lower() for ind in error_indicators):
+                logger.error(
+                    f"bw apikey login FAILED (recognized error indicator). "
+                    f"Output: {output!r}"
+                )
+                return False
+
+            # Check for success
+            if "You are logged in" not in output:
+                logger.error(
+                    f"bw apikey login FAILED (no success indicator). "
+                    f"Output: {output!r}"
+                )
+                return False
+
+            # Login successful! Now unlock the vault with master password
+            if not self.password:
+                logger.warning(
+                    "No master password (BITWARDEN_PASSWORD) set - "
+                    "vault stays locked. Subsequent bw calls may fail."
+                )
+                return True
+
+            logger.debug("Unlocking vault with master password")
+            unlock_child = pexpect.spawn(
+                'env',
+                ['NODE_TLS_REJECT_UNAUTHORIZED=0', 'bw', 'unlock', '--raw'],
+                timeout=30
+            )
+            unlock_child.expect('Master password:')
+            unlock_child.sendline(self.password)
+            unlock_child.expect(pexpect.EOF, timeout=30)
+
+            unlock_output = unlock_child.before.decode('utf-8') if unlock_child.before else ''
+            try:
+                unlock_child.close()
+            except:
+                pass
+
+            logger.info(f"bw unlock raw output (first 500 chars): {unlock_output[:500]!r}")
+
+            unlock_stripped = unlock_output.strip()
+            if unlock_stripped and len(unlock_stripped) > 10:
+                # bw unlock --raw gibt den Session-Key als rohen String zurück
+                self.session_key = unlock_stripped
+                logger.info("Vault unlocked successfully, session_key set")
                 return True
             else:
-                logger.error(f"Authentication failed - no session key received. Output: {output}")
+                logger.warning(
+                    f"bw unlock returned short/empty output: {unlock_output!r}"
+                )
                 return False
 
         except pexpect.TIMEOUT:
