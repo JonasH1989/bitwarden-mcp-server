@@ -22,9 +22,9 @@ from dataclasses import dataclass
 
 import requests
 import urllib3
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from Crypto.Cipher import AES
+from Crypto.Hash import SHA256
+from Crypto.Protocol.KDF import PBKDF2, HKDF
 
 # Suppress SSL warnings (we deliberately skip cert verification because
 # Vaultwarden uses self-signed certs in Jonas' deployment)
@@ -275,27 +275,28 @@ class BitwardenCLIClient:
         2. stretched_hash = PBKDF2-SHA256(password_hash, password_hash, 1)
         3. master_key = HKDF-SHA256(stretched_hash, info="bitwarden-master-password-auth-v2")
         """
-        password_hash = hashlib.pbkdf2_hmac(
-            "sha256",
+        password_hash = PBKDF2(
             password.encode("utf-8"),
             email.lower().encode("utf-8"),
-            kdf_iterations,
-            dklen=32,
+            dkLen=32,
+            count=kdf_iterations,
+            hmac_hash_module=SHA256,
         )
-        stretched = hashlib.pbkdf2_hmac(
-            "sha256",
+        stretched = PBKDF2(
             password_hash,
             password_hash,
-            1,
-            dklen=32,
+            dkLen=32,
+            count=1,
+            hmac_hash_module=SHA256,
         )
-        hkdf = HKDF(
-            algorithm=hashes.SHA256(),
-            length=32,
+        master_key = HKDF(
+            master=stretched,
+            key_len=32,
             salt=b"",
-            info=b"bitwarden-master-password-auth-v2",
+            hashmod=SHA256,
+            context=b"bitwarden-master-password-auth-v2",
         )
-        return hkdf.derive(stretched)
+        return master_key
 
     def _decrypt_enc_string(self, enc_string: str, key: bytes) -> Optional[str]:
         """Decrypt a Bitwarden encString. Format: "2.iv|ct|tag" (AES-GCM) or "0.iv|ct|mac" (AES-CBC)."""
@@ -307,10 +308,15 @@ class BitwardenCLIClient:
                 return None
             version = parts[0]
             iv = base64.b64decode(parts[1])
-            ciphertext = base64.b64decode(parts[2])
-            if version == "2":  # AES-GCM (current)
-                aesgcm = AESGCM(key)
-                plaintext = aesgcm.decrypt(iv, ciphertext)
+            ciphertext_with_tag = base64.b64decode(parts[2])
+            if version == "2":  # AES-GCM (current, pycryptodome)
+                if len(ciphertext_with_tag) < 16:
+                    return None
+                # Last 16 bytes are the GCM tag, rest is ciphertext
+                ciphertext = ciphertext_with_tag[:-16]
+                tag = ciphertext_with_tag[-16:]
+                cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
+                plaintext = cipher.decrypt_and_verify(ciphertext, tag)
                 return plaintext.decode("utf-8")
             elif version == "0":  # AES-CBC-HMAC (legacy)
                 logger.warning("AES-CBC-HMAC (version 0) decryption not implemented")
