@@ -207,14 +207,14 @@ class BitwardenCLIClient:
 
         Vaultwarden returns all items via /api/sync (not /api/items).
         We fetch the full sync response, then filter the items array locally.
+        Note: items are under the key "ciphers" (Bitwarden API convention),
+        NOT "items" — that's why we use data.get("ciphers", ...).
         """
         if not self._ensure_logged_in():
             logger.error("search_items: not authenticated")
             return []
 
         try:
-            # Vaultwarden's /api/sync returns profile + folders + items + collections + ...
-            # There is NO /api/items list endpoint (404), so we use /api/sync.
             resp = self._request("GET", "/api/sync", timeout=30)
             self._log_response("GET /api/sync", resp)
             if resp.status_code != 200:
@@ -222,7 +222,19 @@ class BitwardenCLIClient:
                 return []
 
             data = resp.json()
-            items_data = data.get("items", [])
+            # DIAGNOSE: log the response structure (top-level keys + their types)
+            logger.info(f"/api/sync response keys: {list(data.keys())}")
+            for key in data.keys():
+                val = data[key]
+                if isinstance(val, list):
+                    logger.info(f"  {key}: list with {len(val)} items")
+                elif isinstance(val, dict):
+                    logger.info(f"  {key}: dict with keys {list(val.keys())[:5]}")
+                else:
+                    logger.info(f"  {key}: {type(val).__name__}")
+
+            # Vaultwarden returns items under "ciphers" (Bitwarden API convention)
+            items_data = data.get("ciphers", data.get("items", []))
             if not isinstance(items_data, list):
                 logger.error(f"Unexpected items format in /api/sync: {type(items_data)}")
                 return []
@@ -376,7 +388,8 @@ class BitwardenCLIClient:
     def list_folders(self) -> List[Dict[str, Any]]:
         """List all folders.
 
-        Like items, folders are also fetched via /api/sync (no /api/folders list endpoint).
+        Like items, folders are also fetched via /api/sync.
+        Note: folders are under the key "folders" in the sync response.
         """
         if not self._ensure_logged_in():
             return []
@@ -388,6 +401,7 @@ class BitwardenCLIClient:
             data = resp.json()
             folders = data.get("folders", [])
             if not isinstance(folders, list):
+                logger.warning(f"Unexpected folders format: {type(folders)}")
                 return []
             return folders
         except Exception as e:
