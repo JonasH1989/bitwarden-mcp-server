@@ -451,7 +451,7 @@ class BitwardenCLIClient:
                     try:
                         item = self._decrypt_cipher(item, self.user_key)
                     except Exception as e:
-                        logger.warning(f"Decrypt failed for cipher {item.get("id")}: {e}")
+                        logger.warning(f"Decrypt failed for cipher {item.get('id')}: {e}")
                         # Continue with encrypted data
                 # Filter by type
                 if target_type and item.get("type") != target_type:
