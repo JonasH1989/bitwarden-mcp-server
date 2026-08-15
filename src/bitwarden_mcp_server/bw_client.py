@@ -407,7 +407,7 @@ class BitwardenCLIClient:
             logger.error(f"Decryption error for encString: {e}")
             return None
 
-    def _decrypt_user_key(self, master_password_unlock: str, master_key: bytes) -> Optional[bytes]:
+    def _decrypt_user_key(self, master_password_unlock, master_key: bytes) -> Optional[bytes]:
         """Decrypt the user encryption key (encKey) from masterPasswordUnlock.
 
         The decrypted plaintext is the full 64-byte user_key (encKey || macKey).
@@ -415,17 +415,70 @@ class BitwardenCLIClient:
         Storing the full 64 bytes would cause AES.new() to reject the key
         with "Incorrect AES key length".
         """
-        # Diagnostic: log format of masterPasswordUnlock (no secret content!)
-        if master_password_unlock:
-            # Diagnostic: log format of masterPasswordUnlock (no secret content!)
-            if master_password_unlock:
-                mpu_starts = master_password_unlock[:6]
-                mpu_version = master_password_unlock.split('.')[0] if '.' in master_password_unlock else '?'
-                logger.info(
-                    f"masterPasswordUnlock format: starts={mpu_starts!r} "
-                    f"len={len(master_password_unlock)} version={mpu_version!r}"
+        # Normalize masterPasswordUnlock to a string (Vaultwarden may return dict/bytes/str)
+        try:
+            logger.info(
+                f"_decrypt_user_key: master_password_unlock type={type(master_password_unlock).__name__} "
+                f"is_truthy={bool(master_password_unlock)}"
+            )
+        except Exception:
+            pass
+
+        if not master_password_unlock:
+            logger.warning("master_password_unlock is falsy (None/empty)")
+            return None
+
+        if isinstance(master_password_unlock, dict):
+            # Vaultwarden can return {"value": "..."} or {"data": "..."} structures
+            logger.info(
+                f"masterPasswordUnlock is a DICT with keys: {list(master_password_unlock.keys())}"
+            )
+            mpu_str = (
+                master_password_unlock.get("value")
+                or master_password_unlock.get("data")
+                or master_password_unlock.get("kdfPassword")
+                or master_password_unlock.get("kdfKey")
+                or ""
+            )
+            if not mpu_str:
+                logger.error(
+                    f"masterPasswordUnlock dict has no value/data/kdfPassword/kdfKey. "
+                    f"Full dict: {master_password_unlock!r}"
                 )
-        plaintext = self._decrypt_enc_string(master_password_unlock, master_key)
+                return None
+            logger.info(f"Extracted masterPasswordUnlock string from dict (len={len(str(mpu_str))})")
+            mpu_str = str(mpu_str)
+        elif isinstance(master_password_unlock, bytes):
+            logger.info("masterPasswordUnlock is bytes, decoding to str")
+            try:
+                mpu_str = master_password_unlock.decode("utf-8")
+            except Exception as e:
+                logger.error(f"Failed to decode bytes: {e}")
+                return None
+        elif isinstance(master_password_unlock, str):
+            mpu_str = master_password_unlock
+        else:
+            logger.error(
+                f"masterPasswordUnlock has unexpected type: {type(master_password_unlock).__name__}"
+            )
+            return None
+
+        if not mpu_str:
+            logger.warning("masterPasswordUnlock string is empty after normalization")
+            return None
+
+        # Diagnostic: log format (no secret content!)
+        try:
+            mpu_starts = mpu_str[:6]
+            mpu_version = mpu_str.split('.')[0] if '.' in mpu_str else '?'
+            logger.info(
+                f"masterPasswordUnlock format: starts={mpu_starts!r} "
+                f"len={len(mpu_str)} version={mpu_version!r}"
+            )
+        except Exception as e:
+            logger.error(f"masterPasswordUnlock format log error: {e}")
+
+        plaintext = self._decrypt_enc_string(mpu_str, master_key)
         if not plaintext:
             logger.warning(
                 f"masterPasswordUnlock decryption FAILED (returned None/empty) "
