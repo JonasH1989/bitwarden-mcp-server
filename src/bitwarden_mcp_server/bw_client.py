@@ -451,10 +451,18 @@ class BitwardenCLIClient:
                     logger.error("Missing salt, enc_user_key, or master_key")
                     return None
                 try:
+                    # Decode salt (it's base64-encoded in the new Bitwarden format)
+                    try:
+                        salt_bytes = base64.b64decode(salt) if isinstance(salt, str) else salt
+                    except Exception as e:
+                        logger.error(f"Failed to base64-decode salt: {e}")
+                        return None
+                    logger.info(f"Salt decoded: {len(salt_bytes)} bytes (from {len(str(salt))} base64 chars)")
+
                     # v2: HKDF with auth-v2 info
                     password_hash = PBKDF2(
                         self.password.encode("utf-8"),
-                        str(salt).encode("utf-8"),
+                        salt_bytes,
                         dkLen=32,
                         count=int(kdf_iterations),
                         hmac_hash_module=SHA256,
@@ -473,9 +481,10 @@ class BitwardenCLIClient:
                         hashmod=SHA256,
                         context=b"bitwarden-master-password-auth-v2",
                     )
+                    # v1: PBKDF2(stretched, email.lower(), 1) — old style
                     master_key_v1 = PBKDF2(
                         stretched,
-                        str(salt).encode("utf-8"),
+                        email.lower().encode("utf-8"),
                         dkLen=32,
                         count=1,
                         hmac_hash_module=SHA256,
