@@ -429,10 +429,75 @@ class BitwardenCLIClient:
             return None
 
         if isinstance(master_password_unlock, dict):
-            # Vaultwarden can return {"value": "..."} or {"data": "..."} structures
             logger.info(
                 f"masterPasswordUnlock is a DICT with keys: {list(master_password_unlock.keys())}"
             )
+            # New Bitwarden 2024+ format:
+            # {"kdf": {...}, "masterKeyEncryptedUserKey": "...", "masterKeyWrappedUserKey": "...", "salt": "..."}
+            if "masterKeyEncryptedUserKey" in master_password_unlock and "salt" in master_password_unlock:
+                logger.info("Detected new Bitwarden 2024+ KDF format (salt + encrypted user key)")
+                kdf_config = master_password_unlock.get("kdf", {})
+                kdf_type = kdf_config.get("kdfType", 0)
+                kdf_iterations = kdf_config.get("iterations", 600000)
+                salt = master_password_unlock.get("salt", "")
+                enc_user_key = master_password_unlock.get("masterKeyEncryptedUserKey", "")
+                wrapped_user_key = master_password_unlock.get("masterKeyWrappedUserKey", "")
+                logger.info(
+                    f"KDF config: type={kdf_type} iterations={kdf_iterations} "
+                    f"salt_len={len(str(salt))} enc_user_key_len={len(str(enc_user_key))}"
+                )
+                # Derive master_key using the explicit salt (NOT email)
+                if not salt or not enc_user_key or not master_key:
+                    logger.error("Missing salt, enc_user_key, or master_key")
+                    return None
+                try:
+                    # v2: HKDF with auth-v2 info
+                    password_hash = PBKDF2(
+                        master_password.encode("utf-8"),
+                        str(salt).encode("utf-8"),
+                        dkLen=32,
+                        count=int(kdf_iterations),
+                        hmac_hash_module=SHA256,
+                    )
+                    stretched = PBKDF2(
+                        password_hash,
+                        password_hash,
+                        dkLen=32,
+                        count=1,
+                        hmac_hash_module=SHA256,
+                    )
+                    master_key_v2 = HKDF(
+                        master=stretched,
+                        key_len=32,
+                        salt=b"",
+                        hashmod=SHA256,
+                        context=b"bitwarden-master-password-auth-v2",
+                    )
+                    master_key_v1 = PBKDF2(
+                        stretched,
+                        str(salt).encode("utf-8"),
+                        dkLen=32,
+                        count=1,
+                        hmac_hash_module=SHA256,
+                    )
+                    # Try v2 first, then v1
+                    plaintext = self._decrypt_enc_string(str(enc_user_key), master_key_v2)
+                    if plaintext is None:
+                        logger.info("v2 failed, trying v1...")
+                        plaintext = self._decrypt_enc_string(str(enc_user_key), master_key_v1)
+                    if plaintext is None:
+                        logger.error("Both v2 and v1 failed for enc_user_key")
+                        return None
+                    raw = plaintext.encode("latin-1") if isinstance(plaintext, str) else plaintext
+                    if len(raw) >= 32:
+                        logger.info(f"Decrypted user_key (new format): raw_len={len(raw)}")
+                        return raw[:32]
+                    logger.error(f"Decrypted user_key too short: {len(raw)}")
+                    return None
+                except Exception as e:
+                    logger.error(f"Key derivation (new format) error: {e}")
+                    return None
+            # Legacy dict format
             mpu_str = (
                 master_password_unlock.get("value")
                 or master_password_unlock.get("data")
