@@ -120,7 +120,11 @@ class BitwardenCLIClient:
             raise Exception(f"bw command failed: {str(e)}")
     
     def authenticate(self) -> bool:
-        """Authenticate with Bitwarden/Vaultwarden via User-API-Key (bw login --apikey).
+        """Authenticate with Bitwarden/Vaultwarden via bw login --apikey (OAuth2 Client-Credentials).
+
+        bw 2026.2.0 mit --apikey erwartet zwei interaktive Prompts:
+          1. "? client_id: "     → wir senden den User-API-Key (aus BITWARDEN_CLIENT_ID)
+          2. "? client_secret: " → wir senden das Client-Secret (aus BITWARDEN_CLIENT_SECRET)
 
         Umgeht komplett:
         - Master-Pwd-Flow (kein PBKDF2, keine 2FA)
@@ -140,16 +144,18 @@ class BitwardenCLIClient:
             # Configure server
             self._run_bw_command(['config', 'server', self.base_url])
 
-            # API-Key-Login via bw login --apikey (kein Master-Pwd, kein 2FA).
-            # bw fragt interaktiv nach "API key: " und erwartet den User-API-Key.
+            # OAuth2 Client-Credentials Login via bw login --apikey *** Master-Pwd, kein 2FA).
+            # bw fragt interaktiv nach "client_id:" und "client_secret:" (NICHT "API key:").
             logger.debug("Starting interactive apikey login with pexpect")
             child = pexpect.spawn(
                 'env',
                 ['NODE_TLS_REJECT_UNAUTHORIZED=0', 'bw', 'login', '--apikey'],
                 timeout=30
             )
-            child.expect('API key:')
+            child.expect('client_id:')
             child.sendline(self.api_key)
+            child.expect('client_secret:')
+            child.sendline(self.client_secret)
 
             # Wait for completion and get output
             child.expect(pexpect.EOF)
@@ -187,7 +193,7 @@ class BitwardenCLIClient:
         except Exception as e:
             logger.error(f"Apikey authentication failed: {str(e)}")
             return False
-    
+
     def logout(self) -> bool:
         """Logout from Bitwarden.
         
