@@ -11,6 +11,8 @@ Why HTTP instead of bw CLI?
 - Smaller container image (no Node.js + bw CLI needed)
 """
 
+import base64
+import hashlib
 import json
 import logging
 import os
@@ -20,6 +22,9 @@ from dataclasses import dataclass
 
 import requests
 import urllib3
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 # Suppress SSL warnings (we deliberately skip cert verification because
 # Vaultwarden uses self-signed certs in Jonas' deployment)
@@ -93,6 +98,10 @@ class BitwardenCLIClient:
             "User-Agent": "ustack-bitwarden-mcp/2.0.0",
             "Accept": "application/json",
         })
+
+        # Encryption state (derived after OAuth2)
+        self.user_key: Optional[bytes] = None  # Symmetric key for decrypting cipher fields
+        self.user_email: Optional[str] = None  # Cached from /api/sync profile
 
     # ----- OAuth2 Authentication -----
 
@@ -199,6 +208,135 @@ class BitwardenCLIClient:
             f"(body {len(resp.text)} chars, first 300: {resp.text[:300]!r})"
         )
 
+    # ----- Vaultwarden encryption helpers -----
+
+    def _derive_master_key(self, password: str, email: str, kdf_iterations: int) -> bytes:
+        """Derive the master encryption key from the user's master password.
+
+        Uses Bitwarden's v2 auth flow:
+        1. password_hash = PBKDF2-SHA256(password, email.lower(), kdf_iterations)
+        2. stretched_hash = PBKDF2-SHA256(password_hash, password_hash, 1)
+        3. master_key = HKDF-SHA256(stretched_hash, info="bitwarden-master-password-auth-v2")
+        """
+        password_hash = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            email.lower().encode("utf-8"),
+            kdf_iterations,
+            dklen=32,
+        )
+        stretched = hashlib.pbkdf2_hmac(
+            "sha256",
+            password_hash,
+            password_hash,
+            1,
+            dklen=32,
+        )
+        hkdf = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=b"",
+            info=b"bitwarden-master-password-auth-v2",
+        )
+        return hkdf.derive(stretched)
+
+    def _decrypt_enc_string(self, enc_string: str, key: bytes) -> Optional[str]:
+        """Decrypt a Bitwarden encString. Format: "2.iv|ct|tag" (AES-GCM) or "0.iv|ct|mac" (AES-CBC)."""
+        if not enc_string or not isinstance(enc_string, str):
+            return None
+        try:
+            parts = enc_string.split(".", 2)
+            if len(parts) != 3:
+                return None
+            version = parts[0]
+            iv = base64.b64decode(parts[1])
+            ciphertext = base64.b64decode(parts[2])
+            if version == "2":  # AES-GCM (current)
+                aesgcm = AESGCM(key)
+                plaintext = aesgcm.decrypt(iv, ciphertext)
+                return plaintext.decode("utf-8")
+            elif version == "0":  # AES-CBC-HMAC (legacy)
+                logger.warning("AES-CBC-HMAC (version 0) decryption not implemented")
+                return None
+            else:
+                logger.warning(f"Unknown encryption version: {version}")
+                return None
+        except Exception as e:
+            logger.error(f"Decryption error for encString: {e}")
+            return None
+
+    def _decrypt_user_key(self, master_password_unlock: str, master_key: bytes) -> Optional[bytes]:
+        """Decrypt the user encryption key from masterPasswordUnlock using master_key."""
+        plaintext = self._decrypt_enc_string(master_password_unlock, master_key)
+        if not plaintext:
+            return None
+        # The decrypted value is the user_key (64 bytes). Try raw bytes first.
+        try:
+            raw = plaintext.encode("latin-1") if isinstance(plaintext, str) else plaintext
+            if len(raw) >= 32:
+                return raw[:64] if len(raw) >= 64 else raw
+        except Exception:
+            pass
+        return None
+
+    def _decrypt_cipher(self, cipher: Dict, user_key: bytes) -> Dict:
+        """Decrypt all encrypted fields of a cipher using user_key. Returns dict with plaintext."""
+        out = {
+            "id": cipher.get("id"),
+            "type": cipher.get("type"),
+            "folderId": cipher.get("folderId"),
+            "favorite": cipher.get("favorite", False),
+            "organizationId": cipher.get("organizationId"),
+            "collectionIds": cipher.get("collectionIds", []),
+            "revisionDate": cipher.get("revisionDate"),
+            "creationDate": cipher.get("creationDate"),
+        }
+        # Decrypt name
+        name = cipher.get("name")
+        if name and isinstance(name, str) and name[:1] in ("0", "2"):
+            d = self._decrypt_enc_string(name, user_key)
+            if d is not None:
+                out["name"] = d
+            else:
+                out["name"] = name
+        else:
+            out["name"] = name
+        # Decrypt notes
+        notes = cipher.get("notes")
+        if notes and isinstance(notes, str) and notes[:1] in ("0", "2"):
+            d = self._decrypt_enc_string(notes, user_key)
+            if d is not None:
+                out["notes"] = d
+        else:
+            out["notes"] = notes
+        # Decrypt login fields
+        if cipher.get("login"):
+            orig_login = cipher["login"]
+            login = {}
+            for field in ("username", "password", "totp"):
+                val = orig_login.get(field)
+                if val and isinstance(val, str) and val[:1] in ("0", "2"):
+                    d = self._decrypt_enc_string(val, user_key)
+                    login[field] = d if d is not None else val
+                else:
+                    login[field] = val
+            # Decrypt URIs
+            if orig_login.get("uris"):
+                decrypted_uris = []
+                for uri_obj in orig_login["uris"]:
+                    if isinstance(uri_obj, dict):
+                        uri = uri_obj.get("uri", "")
+                        if uri and isinstance(uri, str) and uri[:1] in ("0", "2"):
+                            d = self._decrypt_enc_string(uri, user_key)
+                            new_obj = dict(uri_obj)
+                            new_obj["uri"] = d if d is not None else uri
+                        else:
+                            new_obj = dict(uri_obj)
+                        decrypted_uris.append(new_obj)
+                login["uris"] = decrypted_uris
+            out["login"] = login
+        return out
+
     # ----- Item operations -----
 
     def search_items(self, query: str = None, item_type: str = None,
@@ -243,7 +381,15 @@ class BitwardenCLIClient:
             query_lower = query.lower() if query else None
 
             results: List[BitwardenItem] = []
+            # Decrypt ciphers if we have user_key
             for item in items_data:
+                # Decrypt if user_key available
+                if self.user_key:
+                    try:
+                        item = self._decrypt_cipher(item, self.user_key)
+                    except Exception as e:
+                        logger.warning(f"Decrypt failed for cipher {item.get("id")}: {e}")
+                        # Continue with encrypted data
                 # Filter by type
                 if target_type and item.get("type") != target_type:
                     continue
