@@ -1,26 +1,38 @@
 """
-Bitwarden CLI-based MCP Server Client
+Vaultwarden HTTP-based MCP Server Client.
 
-This module provides a client for interacting with Bitwarden/Vaultwarden
-via the Bitwarden CLI (bw) for password management and secure notes.
+This module provides a client for interacting with Vaultwarden via direct
+HTTP requests (no bw CLI dependency). Uses OAuth2 client_credentials flow
+for authentication.
+
+Why HTTP instead of bw CLI?
+- bw 2026.2.0 with --apikey was opaque about Vaultwarden's actual responses
+- Direct HTTP gives us full visibility into every JSON/HTML response
+- Smaller container image (no Node.js + bw CLI needed)
 """
 
-import subprocess
 import json
 import logging
 import os
-import pexpect
+import urllib.parse
 from typing import Dict, List, Any, Optional
 from dataclasses import dataclass
 
+import requests
+import urllib3
+
+# Suppress SSL warnings (we deliberately skip cert verification because
+# Vaultwarden uses self-signed certs in Jonas' deployment)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 # Setup logging
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class BitwardenItem:
-    """Represents a Bitwarden item (password, note, etc.)"""
+    """Represents a Vaultwarden item (password, note, etc.)"""
     id: str
     name: str
     username: Optional[str] = None
@@ -36,683 +48,435 @@ class BitwardenItem:
             self.uris = []
 
 
+# Default configuration (env-driven)
+DEFAULT_BASE_URL = os.getenv("BITWARDEN_BASE_URL", "https://vault.bitwarden.com")
+DEFAULT_API_KEY = os.getenv("BITWARDEN_CLIENT_ID", "")  # OAuth2 client_id (user.xxx UUID)
+DEFAULT_CLIENT_SECRET = os.getenv("BITWARDEN_CLIENT_SECRET", "")
+# Legacy fields (deprecated)
+DEFAULT_EMAIL = os.getenv("BITWARDEN_EMAIL", "")
+DEFAULT_PASSWORD = os.getenv("BITWARDEN_PASSWORD", "")
+
+
 class BitwardenCLIClient:
-    """Client for Bitwarden using the bw CLI tool."""
-    
+    """HTTP-based client for Vaultwarden.
+
+    Uses OAuth2 client_credentials flow for authentication.
+    Subsequent API calls use Authorization: Bearer <access_token>.
+    """
+
+    # Vaultwarden/Bitwarden item type mapping
+    TYPE_MAP = {"login": 1, "note": 2, "card": 3, "identity": 4}
+
     def __init__(self, base_url: str, api_key: Optional[str] = None,
                  email: Optional[str] = None, password: Optional[str] = None,
                  client_secret: Optional[str] = None):
-        """Initialize the Bitwarden CLI client.
-
-        Args:
-            base_url: Bitwarden/Vaultwarden server URL
-            api_key: User-API-Key (Format "user.<uuid>"). Bevorzugt für bw login --apikey.
-                     Wird per BITWARDEN_CLIENT_ID env var gesetzt.
-            email: (Deprecated) User email — Legacy-Master-Pwd-Flow, nicht mehr benötigt.
-            password: (Deprecated) User master password — siehe oben.
-            client_secret: (Deprecated) Client secret — Service-User-Credentials-Flow.
-        """
         self.base_url = base_url.rstrip('/')
         self.api_key = api_key
         self.email = email
         self.password = password
         self.client_secret = client_secret
-        self.session_key = None
 
-        # Set environment variables for bw CLI
-        os.environ['BW_SERVER'] = self.base_url
-        # Client-Secret als ENV setzen, falls vorhanden (für OAuth2-Flows)
-        if self.client_secret:
-            os.environ['BW_CLIENTSECRET'] = self.client_secret
-        
-    def _run_bw_command(self, command: List[str], input_data: str = None) -> Dict[str, Any]:
-        """Run a bw CLI command and return the JSON response.
-        
-        Args:
-            command: List of command arguments
-            input_data: Input data to send to stdin
-            
-        Returns:
-            JSON response from bw CLI
-        """
-        try:
-            # Set environment for TLS issues with Vaultwarden
-            env = os.environ.copy()
-            env['NODE_TLS_REJECT_UNAUTHORIZED'] = '0'
-            
-            logger.debug(f"Running bw command: {' '.join(command)}")
-            
-            # Use env command to set NODE_TLS_REJECT_UNAUTHORIZED=0
-            process = subprocess.run(
-                ['env', 'NODE_TLS_REJECT_UNAUTHORIZED=0', 'bw'] + command,
-                input=input_data,
-                text=True,
-                capture_output=True,
-                timeout=30,
-                env=env
-            )
-            
-            logger.debug(f"bw exit code: {process.returncode}")
-            logger.debug(f"bw stdout: {process.stdout[:500]}")
-            if process.stderr:
-                logger.debug(f"bw stderr: {process.stderr[:500]}")
-            
-            if process.returncode != 0:
-                error_msg = process.stderr or process.stdout or "Unknown error"
-                raise Exception(f"bw command failed: {error_msg}")
-            
-            if process.stdout.strip():
-                try:
-                    return json.loads(process.stdout)
-                except json.JSONDecodeError:
-                    # Some commands return plain text (like config server)
-                    return {"message": process.stdout.strip()}
-            return {}
-            
-        except subprocess.TimeoutExpired:
-            raise Exception("bw command timed out")
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse bw output as JSON: {e}")
-            logger.error(f"Raw output: {process.stdout}")
-            raise Exception(f"Invalid JSON response from bw: {e}")
-        except Exception as e:
-            logger.error(f"bw command error: {str(e)}")
-            raise Exception(f"bw command failed: {str(e)}")
-    
+        # OAuth2 tokens
+        self.access_token: Optional[str] = None
+        self.refresh_token: Optional[str] = None
+        self.token_expires_at: Optional[float] = None
+
+        # Device identification (Vaultwarden requires this for OAuth2)
+        self.device_identifier = "ustack-bitwarden-mcp-server"
+        self.device_name = "Ustack Bitwarden MCP Server"
+        self.device_type = "8"  # 8 = Server / CLI per Bitwarden device types
+
+        # HTTP session (reuses connection pool)
+        self.session = requests.Session()
+        self.session.verify = False  # Skip TLS cert verification (self-signed Vaultwarden)
+        self.session.headers.update({
+            "User-Agent": "ustack-bitwarden-mcp/2.0.0",
+            "Accept": "application/json",
+        })
+
+    # ----- OAuth2 Authentication -----
+
     def authenticate(self) -> bool:
-        """OAuth2 Client-Credentials Login via bw login --apikey *** Master-Pwd unlock).
+        """OAuth2 client_credentials flow via /identity/connect/token.
 
-        bw 2026.2.0 mit --apikey *** verschiedene Verhaltensweisen:
-          a) Vaultwarden kennt das Secret → nur "client_id:" Prompt, dann
-             direkt "You are logged in!" (kein client_secret Prompt)
-          b) Vaultwarden kennt das Secret nicht → fragt nach "client_secret:"
-
-        Wir behandeln beide Flows. Nach erfolgreichem Login:
-          - bw ist eingeloggt, aber Vault ist locked
-          - Wir rufen `bw unlock` auf mit self.password (falls vorhanden)
-          - Session-Key wird in self.session_key gespeichert für --session
-
-        Umgeht komplett:
-        - Master-Pwd-Flow (kein PBKDF2, keine 2FA)
-        - /identity/accounts/login Endpoint (auf Vaultwarden 404)
-        - /api/accounts/login Endpoint (gleicher Bug)
-
-        Returns:
-            True if authentication successful, False otherwise
+        Returns True on success (access_token set), False otherwise.
         """
+        if not self.api_key or not self.client_secret:
+            logger.error(
+                "Missing API key or client secret. "
+                "Set BITWARDEN_CLIENT_ID and BITWARDEN_CLIENT_SECRET."
+            )
+            return False
+
+        token_url = f"{self.base_url}/identity/connect/token"
+        payload = {
+            "grant_type": "client_credentials",
+            "client_id": self.api_key,
+            "client_secret": self.client_secret,
+            "scope": "api",
+            "device_identifier": self.device_identifier,
+            "device_name": self.device_name,
+            "device_type": self.device_type,
+        }
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+        logger.info(f"OAuth2 token request to {token_url}")
         try:
-            # First logout if already logged in
-            try:
-                self._run_bw_command(['logout'])
-            except:
-                pass  # Ignore logout errors
-
-            # Configure server
-            self._run_bw_command(['config', 'server', self.base_url])
-
-            # OAuth2 Client-Credentials Login via bw login --apikey *** Master-Pwd, kein 2FA).
-            logger.debug("Starting interactive apikey login with pexpect")
-            child = pexpect.spawn(
-                'env',
-                ['NODE_TLS_REJECT_UNAUTHORIZED=0', 'bw', 'login', '--apikey'],
-                timeout=30
+            resp = self.session.post(
+                token_url, data=payload, headers=headers, timeout=30
             )
-            child.expect('client_id:')
-            child.sendline(self.api_key)
-
-            # Nächster Prompt ist entweder client_secret (Vaultwarden kennt Secret nicht)
-            # ODER direkt "You are logged in!" (Vaultwarden kennt Secret)
-            # ODER EOF bei unerwartetem Fehler
-            idx = child.expect(
-                ['client_secret:', 'You are logged in', pexpect.EOF],
-                timeout=30
-            )
-            if idx == 0:
-                # bw fragt nach client_secret - senden
-                child.sendline(self.client_secret)
-                child.expect(pexpect.EOF, timeout=30)
-
-            # Output capture (VOR close)
-            output = child.before.decode('utf-8') if child.before else ''
-            try:
-                child.close()
-            except:
-                pass
-
-            # DIAGNOSE-PATCH: rohen bw-Output loggen
-            logger.info(f"bw apikey login raw output (first 500 chars): {output[:500]!r}")
-
-            # Check for known error indicators
-            error_indicators = [
-                "incorrect", "invalid", "error", "fail", "denied",
-                "not found", "two-step", "verification", "not logged in",
-                "you must", "unable", "cannot", "unexpected",
-            ]
-            if output and any(ind in output.lower() for ind in error_indicators):
-                logger.error(
-                    f"bw apikey login FAILED (recognized error indicator). "
-                    f"Output: {output!r}"
-                )
-                return False
-
-            # Check for success
-            if "You are logged in" not in output:
-                logger.error(
-                    f"bw apikey login FAILED (no success indicator). "
-                    f"Output: {output!r}"
-                )
-                return False
-
-            # Login successful! Now unlock the vault with master password
-            if not self.password:
-                logger.warning(
-                    "No master password (BITWARDEN_PASSWORD) set - "
-                    "vault stays locked. Subsequent bw calls may fail."
-                )
-                return True
-
-            logger.debug("Unlocking vault with master password")
-            unlock_child = pexpect.spawn(
-                'env',
-                ['NODE_TLS_REJECT_UNAUTHORIZED=0', 'bw', 'unlock', '--raw'],
-                timeout=30
-            )
-            unlock_child.expect('Master password:')
-            unlock_child.sendline(self.password)
-            unlock_child.expect(pexpect.EOF, timeout=30)
-
-            unlock_output = unlock_child.before.decode('utf-8') if unlock_child.before else ''
-            try:
-                unlock_child.close()
-            except:
-                pass
-
-            logger.info(f"bw unlock raw output (first 500 chars): {unlock_output[:500]!r}")
-
-            unlock_stripped = unlock_output.strip()
-            if unlock_stripped and len(unlock_stripped) > 10:
-                # bw unlock --raw gibt den Session-Key als rohen String zurück
-                self.session_key = unlock_stripped
-                logger.info("Vault unlocked successfully, session_key set")
-                return True
-            else:
-                logger.warning(
-                    f"bw unlock returned short/empty output: {unlock_output!r}"
-                )
-                return False
-
-        except pexpect.TIMEOUT:
-            logger.error("Apikey authentication timed out")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"OAuth2 HTTP error: {e}")
             return False
-        except Exception as e:
-            logger.error(f"Apikey authentication failed: {str(e)}")
+
+        logger.info(f"OAuth2 response: HTTP {resp.status_code}")
+        # Log response body (truncated) for debugging
+        body_preview = resp.text[:500] if resp.text else ""
+        logger.info(f"OAuth2 response body (first 500 chars): {body_preview!r}")
+
+        if resp.status_code != 200:
+            logger.error(
+                f"OAuth2 token request failed with status {resp.status_code}"
+            )
             return False
+
+        try:
+            token_data = resp.json()
+        except json.JSONDecodeError:
+            logger.error(f"OAuth2 response is not JSON: {resp.text[:200]!r}")
+            return False
+
+        self.access_token = token_data.get("access_token")
+        self.refresh_token = token_data.get("refresh_token")
+        # expires_in is in seconds
+        if "expires_in" in token_data:
+            import time
+            self.token_expires_at = time.time() + token_data["expires_in"]
+
+        if not self.access_token:
+            logger.error(
+                f"No access_token in OAuth2 response: {token_data!r}"
+            )
+            return False
+
+        logger.info("OAuth2 authentication successful — access_token set")
+        return True
 
     def logout(self) -> bool:
-        """Logout from Bitwarden.
-        
-        Returns:
-            True if logout successful, False otherwise
-        """
-        try:
-            self._run_bw_command(['logout'])
-            self.session_key = None
-            logger.info("Successfully logged out from Bitwarden")
-            return True
-        except Exception as e:
-            logger.error(f"Logout failed: {str(e)}")
-            return False
+        """Clear tokens (no explicit logout endpoint needed for client_credentials)."""
+        self.access_token = None
+        self.refresh_token = None
+        self.token_expires_at = None
+        logger.info("Logged out (tokens cleared)")
+        return True
 
-    def unlock_vault(self) -> bool:
-        """Unlock the Bitwarden vault and get session key.
-        
-        Returns:
-            True if unlock successful, False otherwise
-        """
-        try:
-            logger.debug("Unlocking vault with pexpect")
-            child = pexpect.spawn('env', ['NODE_TLS_REJECT_UNAUTHORIZED=0', 'bw', 'unlock', '--raw'], timeout=30)
-            
-            # Wait for password prompt and send password
-            child.expect('Master password:')
-            child.sendline(self.password)
-            
-            # Wait for completion and get output
-            child.expect(pexpect.EOF)
-            output = child.before.decode('utf-8')
-            child.close()
-            
-            # Check if we got a session key
-            if output and len(output.strip()) > 10:
-                self.session_key = output.strip()
-                logger.info("Vault unlocked successfully")
-                return True
-            else:
-                logger.error(f"Unlock failed - no session key received. Output: {output}")
-                return False
-                
-        except pexpect.TIMEOUT:
-            logger.error("Unlock timed out")
-            return False
-        except Exception as e:
-            logger.error(f"Unlock failed: {str(e)}")
-            return False
-    
     def _ensure_logged_in(self) -> bool:
-        """Ensure we're logged in to Bitwarden.
-        
-        Returns:
-            True if logged in, False otherwise
-        """
-        try:
-            # Check if we're already logged in
-            result = self._run_bw_command(['status'])
-            if result and result.get('status') == 'authenticated':
-                return True
-            
-            # If not logged in, try to login
-            logger.info("Not logged in, attempting to login...")
-            return self.authenticate()
-            
-        except Exception as e:
-            logger.error(f"Failed to check login status: {str(e)}")
-            return False
-    
-    def search_items(self, query: str = None, item_type: str = None, 
-                    folder_id: str = None, limit: int = 20) -> List[BitwardenItem]:
-        """Search for Bitwarden items.
-        
-        Args:
-            query: Search term
-            item_type: Item type filter (login, note, card, identity)
-            folder_id: Folder ID filter
-            limit: Maximum number of results
-            
-        Returns:
-            List of BitwardenItem objects
-        """
-        try:
-            # Ensure we're logged in first
-            if not self._ensure_logged_in():
-                logger.error("Not logged in, cannot search items")
-                return []
-            
-            # Build search command
-            cmd = ['list', 'items']
-
-            if query:
-                cmd.extend(['--search', query])
-
-            if item_type:
-                type_map = {
-                    'login': '1',
-                    'note': '2',
-                    'card': '3',
-                    'identity': '4'
-                }
-                if item_type.lower() in type_map:
-                    cmd.extend(['--type', type_map[item_type.lower()]])
-
-            if folder_id:
-                cmd.extend(['--folderid', folder_id])
-
-            # Use --session <key> so bw doesn't ask for master password.
-            # bw is already authenticated via API key (bw login --apikey),
-            # so Vault ist entschlüsselt und kein Prompt nötig.
-            if self.session_key:
-                cmd.extend(['--session', self.session_key])
-
-            # Use pexpect for output capture
-            logger.debug(f"Running bw command with pexpect: {' '.join(cmd)}")
-            child = pexpect.spawn('env', ['NODE_TLS_REJECT_UNAUTHORIZED=0', 'bw'] + cmd, timeout=30)
-
-            # bw gibt JSON direkt zurück (kein Prompt) — auf EOF warten
-            child.expect(pexpect.EOF)
-            output = child.before.decode('utf-8')
-            child.close()
-            
-            # Parse JSON output
-            if output.strip():
-                try:
-                    items_data = json.loads(output)
-                    items = items_data.get('data', []) if isinstance(items_data, dict) else items_data
-                    
-                    # Convert to BitwardenItem objects
-                    result = []
-                    for item in items[:limit]:
-                        bw_item = self._parse_item(item)
-                        if bw_item:
-                            result.append(bw_item)
-                    
-                    return result
-                except json.JSONDecodeError:
-                    logger.error(f"Failed to parse JSON output: {output}")
-                    return []
-            return []
-            
-        except pexpect.TIMEOUT:
-            logger.error("Search items timed out")
-            return []
-        except Exception as e:
-            logger.error(f"Search failed: {str(e)}")
-            return []
-    
-    def get_item(self, item_id: str) -> Optional[BitwardenItem]:
-        """Get a specific Bitwarden item by ID.
-        
-        Args:
-            item_id: Item ID
-            
-        Returns:
-            BitwardenItem object or None if not found
-        """
-        try:
-            cmd = ['get', 'item', item_id]
-            if self.session_key:
-                cmd.extend(['--session', self.session_key])
-            
-            item_data = self._run_bw_command(cmd)
-            
-            if item_data:
-                return self._parse_item(item_data)
-            return None
-            
-        except Exception as e:
-            logger.error(f"Get item failed: {str(e)}")
-            return None
-    
-    def create_login(self, name: str, username: str, password: str, 
-                    uris: List[str] = None, notes: str = None, 
-                    folder_id: str = None) -> Optional[str]:
-        """Create a new login item.
-        
-        Args:
-            name: Item name
-            username: Username
-            password: Password
-            uris: List of URLs
-            notes: Notes
-            folder_id: Folder ID
-            
-        Returns:
-            Created item ID or None if failed
-        """
-        try:
-            # Create item template
-            item_template = {
-                "type": 1,  # Login
-                "name": name,
-                "login": {
-                    "username": username,
-                    "password": password,
-                    "uris": [{"uri": uri} for uri in (uris or [])]
-                },
-                "notes": notes or ""
-            }
-            
-            if folder_id:
-                item_template["folderId"] = folder_id
-            
-            # Encode the item data
-            encode_result = self._run_bw_command(['encode'], json.dumps(item_template))
-            encoded_data = encode_result.get('message', '') if isinstance(encode_result, dict) else str(encode_result)
-            
-            # Create item with encoded data
-            cmd = ['create', 'item']
-            if self.session_key:
-                cmd.extend(['--session', self.session_key])
-            
-            result = self._run_bw_command(cmd, encoded_data)
-            
-            if result and 'id' in result:
-                return result['id']
-            return None
-            
-        except Exception as e:
-            logger.error(f"Create login failed: {str(e)}")
-            return None
-    
-    def create_note(self, name: str, content: str, folder_id: str = None) -> Optional[str]:
-        """Create a new secure note.
-        
-        Args:
-            name: Note name
-            content: Note content
-            folder_id: Folder ID
-            
-        Returns:
-            Created item ID or None if failed
-        """
-        try:
-            # Create note template
-            item_template = {
-                "type": 2,  # SecureNote
-                "name": name,
-                "secureNote": {
-                    "type": 0  # Generic
-                },
-                "notes": content
-            }
-            
-            if folder_id:
-                item_template["folderId"] = folder_id
-            
-            # Encode the item data
-            encode_result = self._run_bw_command(['encode'], json.dumps(item_template))
-            encoded_data = encode_result.get('message', '') if isinstance(encode_result, dict) else str(encode_result)
-            
-            # Create item with encoded data
-            cmd = ['create', 'item']
-            if self.session_key:
-                cmd.extend(['--session', self.session_key])
-            
-            result = self._run_bw_command(cmd, encoded_data)
-            
-            if result and 'id' in result:
-                return result['id']
-            return None
-            
-        except Exception as e:
-            logger.error(f"Create note failed: {str(e)}")
-            return None
-    
-    def update_item(self, item_id: str, **kwargs) -> bool:
-        """Update an existing item.
-        
-        Args:
-            item_id: Item ID to update
-            **kwargs: Fields to update
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        try:
-            # Get current item
-            current_item = self.get_item(item_id)
-            if not current_item:
-                return False
-            
-            # Update fields
-            if 'name' in kwargs:
-                current_item.name = kwargs['name']
-            if 'username' in kwargs:
-                current_item.username = kwargs['username']
-            if 'password' in kwargs:
-                current_item.password = kwargs['password']
-            if 'uris' in kwargs:
-                current_item.uris = kwargs['uris']
-            if 'notes' in kwargs:
-                current_item.notes = kwargs['notes']
-            if 'folder_id' in kwargs:
-                current_item.folder_id = kwargs['folder_id']
-            
-            # Convert back to JSON and update
-            item_data = self._item_to_dict(current_item)
-            result = self._run_bw_command(['edit', 'item', item_id], json.dumps(item_data))
-            
-            return result is not None
-            
-        except Exception as e:
-            logger.error(f"Update item failed: {str(e)}")
-            return False
-    
-    def delete_item(self, item_id: str) -> bool:
-        """Delete an item.
-        
-        Args:
-            item_id: Item ID to delete
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        try:
-            self._run_bw_command(['delete', 'item', item_id])
+        """Re-authenticate if we don't have a valid access_token."""
+        if self.access_token:
+            # Optional: check expiry
+            if self.token_expires_at:
+                import time
+                if time.time() > self.token_expires_at - 30:  # 30s buffer
+                    logger.info("Access token expired, re-authenticating")
+                    return self.authenticate()
             return True
-        except Exception as e:
-            logger.error(f"Delete item failed: {str(e)}")
-            return False
-    
-    def list_folders(self) -> List[Dict[str, Any]]:
-        """List all folders.
-        
-        Returns:
-            List of folder dictionaries
+        return self.authenticate()
+
+    # ----- HTTP helpers -----
+
+    def _request(self, method: str, path: str, **kwargs) -> requests.Response:
+        """Authenticated HTTP request to Vaultwarden."""
+        url = f"{self.base_url}{path}"
+        headers = kwargs.pop("headers", {})
+        if self.access_token:
+            headers["Authorization"] = f"Bearer {self.access_token}"
+        return self.session.request(method, url, headers=headers, **kwargs)
+
+    def _log_response(self, op: str, resp: requests.Response):
+        """Log HTTP response for debugging."""
+        logger.info(
+            f"{op}: HTTP {resp.status_code} "
+            f"(body {len(resp.text)} chars, first 300: {resp.text[:300]!r})"
+        )
+
+    # ----- Item operations -----
+
+    def search_items(self, query: str = None, item_type: str = None,
+                    folder_id: str = None, limit: int = 20) -> List[BitwardenItem]:
+        """Search items by query, type, folder.
+
+        Vaultwarden's REST API doesn't support server-side full-text search.
+        We fetch all items via /api/items, then filter locally.
         """
+        if not self._ensure_logged_in():
+            logger.error("search_items: not authenticated")
+            return []
+
         try:
-            # Ensure we're logged in first
-            if not self._ensure_logged_in():
-                logger.error("Not logged in, cannot list folders")
+            resp = self._request("GET", "/api/items", timeout=30)
+            self._log_response("GET /api/items", resp)
+            if resp.status_code != 200:
+                logger.error(f"GET /api/items failed: {resp.status_code}")
                 return []
-            
-            cmd = ['list', 'folders']
-            
-            # Use pexpect for interactive password prompt
-            logger.debug(f"Running bw command with pexpect: {' '.join(cmd)}")
-            child = pexpect.spawn('env', ['NODE_TLS_REJECT_UNAUTHORIZED=0', 'bw'] + cmd, timeout=30)
-            
-            # Wait for password prompt and send password
-            child.expect('Master password:')
-            child.sendline(self.password)
-            
-            # Wait for completion and get output
-            child.expect(pexpect.EOF)
-            output = child.before.decode('utf-8')
-            child.close()
-            
-            # Parse JSON output
-            if output.strip():
-                try:
-                    folders_data = json.loads(output)
-                    return folders_data.get('data', []) if isinstance(folders_data, dict) else folders_data
-                except json.JSONDecodeError:
-                    logger.error(f"Failed to parse JSON output: {output}")
-                    return []
-            return []
-            
-        except pexpect.TIMEOUT:
-            logger.error("List folders timed out")
-            return []
+
+            data = resp.json()
+            # Vaultwarden may wrap items in {"data": [...]} or return a list directly
+            if isinstance(data, dict):
+                items_data = data.get("data", data.get("items", []))
+            else:
+                items_data = data
+
+            target_type = self.TYPE_MAP.get(item_type.lower()) if item_type else None
+            query_lower = query.lower() if query else None
+
+            results: List[BitwardenItem] = []
+            for item in items_data:
+                # Filter by type
+                if target_type and item.get("type") != target_type:
+                    continue
+                # Filter by folder
+                if folder_id and item.get("folderId") != folder_id:
+                    continue
+                # Filter by query (search name + username + URIs)
+                if query_lower:
+                    name = (item.get("name") or "").lower()
+                    login = item.get("login") or {}
+                    username = (login.get("username") or "").lower()
+                    uris = " ".join(
+                        u.get("uri", "") for u in login.get("uris", [])
+                    ).lower()
+                    haystack = f"{name} {username} {uris}"
+                    if query_lower not in haystack:
+                        continue
+                parsed = self._parse_item(item)
+                if parsed:
+                    results.append(parsed)
+                if len(results) >= limit:
+                    break
+
+            logger.info(f"search_items: found {len(results)} items "
+                        f"(query={query!r}, type={item_type!r})")
+            return results
+
         except Exception as e:
-            logger.error(f"List folders failed: {str(e)}")
+            logger.error(f"search_items error: {e}")
             return []
-    
-    def create_folder(self, name: str) -> Optional[str]:
-        """Create a new folder.
-        
-        Args:
-            name: Folder name
-            
-        Returns:
-            Created folder ID or None if failed
-        """
+
+    def get_item(self, item_id: str) -> Optional[BitwardenItem]:
+        """Get a specific item by ID."""
+        if not self._ensure_logged_in():
+            return None
         try:
-            folder_template = {"name": name}
-            result = self._run_bw_command(['create', 'folder'], json.dumps(folder_template))
-            
-            if result and 'id' in result:
-                return result['id']
-            return None
+            resp = self._request("GET", f"/api/items/{item_id}", timeout=30)
+            self._log_response(f"GET /api/items/{item_id}", resp)
+            if resp.status_code != 200:
+                logger.error(f"GET /api/items/{item_id} failed: {resp.status_code}")
+                return None
+            return self._parse_item(resp.json())
         except Exception as e:
-            logger.error(f"Create folder failed: {str(e)}")
+            logger.error(f"get_item error: {e}")
             return None
-    
-    def _parse_item(self, item_data: Dict[str, Any]) -> Optional[BitwardenItem]:
-        """Parse item data from bw CLI into BitwardenItem object.
-        
-        Args:
-            item_data: Raw item data from bw CLI
-            
-        Returns:
-            BitwardenItem object or None if parsing failed
-        """
-        try:
-            item_id = item_data.get('id', '')
-            name = item_data.get('name', '')
-            item_type = item_data.get('type', 1)
-            
-            # Extract login data
-            username = None
-            password = None
-            uris = []
-            
-            if item_type == 1 and 'login' in item_data:  # Login
-                login_data = item_data['login']
-                username = login_data.get('username')
-                password = login_data.get('password')
-                uris = [uri.get('uri', '') for uri in login_data.get('uris', [])]
-            
-            # Extract notes
-            notes = item_data.get('notes', '')
-            
-            # Extract folder
-            folder_id = item_data.get('folderId')
-            
-            # Extract favorite
-            favorite = item_data.get('favorite', False)
-            
-            return BitwardenItem(
-                id=item_id,
-                name=name,
-                username=username,
-                password=password,
-                uris=uris,
-                notes=notes,
-                folder_id=folder_id,
-                type=item_type,
-                favorite=favorite
-            )
-            
-        except Exception as e:
-            logger.error(f"Failed to parse item: {str(e)}")
+
+    def create_login(self, name: str, username: str, password: str,
+                    uris: List[str] = None, notes: str = None,
+                    folder_id: str = None) -> Optional[str]:
+        """Create a new login item. Returns new item ID or None."""
+        if not self._ensure_logged_in():
             return None
-    
-    def _item_to_dict(self, item: BitwardenItem) -> Dict[str, Any]:
-        """Convert BitwardenItem to dictionary for bw CLI.
-        
-        Args:
-            item: BitwardenItem object
-            
-        Returns:
-            Dictionary representation
-        """
-        item_dict = {
-            "id": item.id,
-            "name": item.name,
-            "type": item.type,
-            "notes": item.notes or "",
-            "favorite": item.favorite
+        item_template = {
+            "type": 1,  # Login
+            "name": name,
+            "login": {
+                "username": username,
+                "password": password,
+                "uris": [{"uri": u} for u in (uris or [])],
+            },
+            "notes": notes or "",
         }
-        
-        if item.folder_id:
-            item_dict["folderId"] = item.folder_id
-        
-        if item.type == 1:  # Login
-            item_dict["login"] = {
-                "username": item.username or "",
-                "password": item.password or "",
-                "uris": [{"uri": uri} for uri in item.uris]
-            }
-        elif item.type == 2:  # SecureNote
-            item_dict["secureNote"] = {"type": 0}
-        
-        return item_dict
+        if folder_id:
+            item_template["folderId"] = folder_id
+        try:
+            resp = self._request("POST", "/api/items", json=item_template, timeout=30)
+            self._log_response("POST /api/items", resp)
+            if resp.status_code in (200, 201):
+                return resp.json().get("id")
+            logger.error(f"create_login failed: {resp.status_code} {resp.text[:200]!r}")
+            return None
+        except Exception as e:
+            logger.error(f"create_login error: {e}")
+            return None
+
+    def create_note(self, name: str, content: str, folder_id: str = None) -> Optional[str]:
+        """Create a new secure note. Returns new item ID or None."""
+        if not self._ensure_logged_in():
+            return None
+        item_template = {
+            "type": 2,  # SecureNote
+            "name": name,
+            "secureNote": {"type": 0},  # Generic
+            "notes": content,
+        }
+        if folder_id:
+            item_template["folderId"] = folder_id
+        try:
+            resp = self._request("POST", "/api/items", json=item_template, timeout=30)
+            self._log_response("POST /api/items", resp)
+            if resp.status_code in (200, 201):
+                return resp.json().get("id")
+            logger.error(f"create_note failed: {resp.status_code} {resp.text[:200]!r}")
+            return None
+        except Exception as e:
+            logger.error(f"create_note error: {e}")
+            return None
+
+    def update_item(self, item_id: str, **kwargs) -> bool:
+        """Update an existing item by ID."""
+        if not self._ensure_logged_in():
+            return False
+        current = self.get_item(item_id)
+        if not current:
+            return False
+        # Apply kwargs to current item
+        if "name" in kwargs:
+            current.name = kwargs["name"]
+        if "username" in kwargs:
+            current.username = kwargs["username"]
+        if "password" in kwargs:
+            current.password = kwargs["password"]
+        if "uris" in kwargs:
+            current.uris = kwargs["uris"]
+        if "notes" in kwargs:
+            current.notes = kwargs["notes"]
+        if "folder_id" in kwargs:
+            current.folder_id = kwargs["folder_id"]
+        try:
+            item_data = self._item_to_dict(current)
+            resp = self._request("PUT", f"/api/items/{item_id}", json=item_data, timeout=30)
+            self._log_response(f"PUT /api/items/{item_id}", resp)
+            return resp.status_code in (200, 204)
+        except Exception as e:
+            logger.error(f"update_item error: {e}")
+            return False
+
+    def delete_item(self, item_id: str) -> bool:
+        """Delete an item by ID."""
+        if not self._ensure_logged_in():
+            return False
+        try:
+            resp = self._request("DELETE", f"/api/items/{item_id}", timeout=30)
+            self._log_response(f"DELETE /api/items/{item_id}", resp)
+            return resp.status_code in (200, 204)
+        except Exception as e:
+            logger.error(f"delete_item error: {e}")
+            return False
+
+    # ----- Folder operations -----
+
+    def list_folders(self) -> List[Dict[str, Any]]:
+        """List all folders."""
+        if not self._ensure_logged_in():
+            return []
+        try:
+            resp = self._request("GET", "/api/folders", timeout=30)
+            self._log_response("GET /api/folders", resp)
+            if resp.status_code != 200:
+                return []
+            data = resp.json()
+            if isinstance(data, dict):
+                return data.get("data", data.get("folders", []))
+            return data
+        except Exception as e:
+            logger.error(f"list_folders error: {e}")
+            return []
+
+    def create_folder(self, name: str) -> Optional[str]:
+        """Create a new folder. Returns new folder ID or None."""
+        if not self._ensure_logged_in():
+            return None
+        try:
+            resp = self._request("POST", "/api/folders", json={"name": name}, timeout=30)
+            self._log_response("POST /api/folders", resp)
+            if resp.status_code in (200, 201):
+                return resp.json().get("id")
+            logger.error(f"create_folder failed: {resp.status_code} {resp.text[:200]!r}")
+            return None
+        except Exception as e:
+            logger.error(f"create_folder error: {e}")
+            return None
+
+    # ----- Parsing helpers -----
+
+    def _parse_item(self, item_data: Dict[str, Any]) -> Optional[BitwardenItem]:
+        """Parse Vaultwarden item JSON into BitwardenItem dataclass."""
+        if not item_data or "id" not in item_data:
+            return None
+        login = item_data.get("login") or {}
+        try:
+            return BitwardenItem(
+                id=item_data["id"],
+                name=item_data.get("name", ""),
+                username=login.get("username"),
+                password=login.get("password"),
+                uris=[u.get("uri") for u in login.get("uris", []) if u.get("uri")],
+                notes=item_data.get("notes"),
+                folder_id=item_data.get("folderId"),
+                type=item_data.get("type", 1),
+                favorite=item_data.get("favorite", False),
+            )
+        except Exception as e:
+            logger.error(f"_parse_item error: {e}")
+            return None
+
+    def _item_to_dict(self, item: BitwardenItem) -> Dict[str, Any]:
+        """Convert BitwardenItem dataclass to Vaultwarden API JSON."""
+        return {
+            "type": item.type,
+            "name": item.name,
+            "login": {
+                "username": item.username,
+                "password": item.password,
+                "uris": [{"uri": u} for u in (item.uris or []) if u],
+            },
+            "notes": item.notes or "",
+            "folderId": item.folder_id,
+            "favorite": item.favorite,
+        }
+
+
+def _get_client(base_url: str = None, api_key: str = None,
+                email: str = None, password: str = None,
+                client_secret: str = None) -> Optional[BitwardenCLIClient]:
+    """Get authenticated Vaultwarden HTTP client."""
+    try:
+        url = base_url or DEFAULT_BASE_URL
+        key = api_key or DEFAULT_API_KEY
+        csecret = client_secret or DEFAULT_CLIENT_SECRET
+        # Legacy fields (no longer required for HTTP client)
+        user_email = email or DEFAULT_EMAIL
+        user_password = password or DEFAULT_PASSWORD
+
+        if not key:
+            logger.error("Missing API key (BITWARDEN_CLIENT_ID env var)")
+            return None
+
+        client = BitwardenCLIClient(
+            url,
+            api_key=key,
+            email=user_email,
+            password=user_password,
+            client_secret=csecret,
+        )
+
+        # Authenticate via OAuth2 client_credentials
+        if not client.authenticate():
+            logger.error("OAuth2 authentication failed")
+            return None
+
+        # No unlock_vault() needed — OAuth2 client_credentials returns
+        # an access_token that's directly usable for /api/* calls.
+
+        return client
+
+    except Exception as e:
+        logger.error(f"Failed to create client: {str(e)}")
+        return None
