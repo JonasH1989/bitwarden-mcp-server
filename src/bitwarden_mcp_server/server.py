@@ -19,10 +19,16 @@ mcp = FastMCP("Bitwarden MCP Server")
 
 # Default configuration
 DEFAULT_BASE_URL = os.getenv("BITWARDEN_BASE_URL", "https://vault.bitwarden.com")
+# User-API-Key (Format: "user.<uuid>") für bw login --apikey.
+# Hinweis: Variable heißt BITWARDEN_CLIENT_ID (irreführender Name aus dem
+# Original-Repo), aber inhaltlich ist es der User-API-Key, NICHT eine
+# OAuth2-Client-ID. Service-User-Flow umgeht Master-Pwd komplett — der
+# kaputte /identity/accounts/login Endpoint auf Vaultwarden ist irrelevant.
+DEFAULT_API_KEY = os.getenv("BITWARDEN_CLIENT_ID", "")
+# Legacy-Felder (deprecated — Master-Pwd-Flow nicht mehr benötigt):
 DEFAULT_EMAIL = os.getenv("BITWARDEN_EMAIL", "")
 DEFAULT_PASSWORD = os.getenv("BITWARDEN_PASSWORD", "")
-DEFAULT_CLIENT_ID = os.getenv("BITWARDEN_CLIENT_ID", "bitwarden-mcp-server")
-DEFAULT_CLIENT_SECRET = os.getenv("BITWARDEN_CLIENT_SECRET", "bitwarden-mcp-secret")
+DEFAULT_CLIENT_SECRET = os.getenv("BITWARDEN_CLIENT_SECRET", "")
 
 
 def _handle_error(e: Exception, operation: str) -> str:
@@ -40,43 +46,44 @@ def _handle_error(e: Exception, operation: str) -> str:
     return f"❌ Error during {operation}: {error_msg}"
 
 
-def _get_client(base_url: str = None, email: str = None, password: str = None,
-                client_id: str = None, client_secret: str = None) -> Optional[BitwardenCLIClient]:
+def _get_client(base_url: str = None, api_key: str = None,
+                email: str = None, password: str = None,
+                client_secret: str = None) -> Optional[BitwardenCLIClient]:
     """Get authenticated Bitwarden client.
     
     Args:
         base_url: Bitwarden server URL
-        email: User email
-        password: User password
-        client_id: Client ID
-        client_secret: Client secret
-        
+        api_key: User-API-Key (Format "user.<uuid>"). Bevorzugt für bw login --apikey.
+        email: User email (deprecated — Legacy-Master-Pwd-Flow, nicht mehr benötigt)
+        password: User password (deprecated — siehe oben)
+        client_secret: Client secret (deprecated — Service-User-Credentials-Flow)
+    
     Returns:
         Authenticated BitwardenClient or None if authentication failed
     """
     try:
         url = base_url or DEFAULT_BASE_URL
+        key = api_key or DEFAULT_API_KEY
+        # Legacy-Felder werden noch akzeptiert aber nicht mehr für Login benötigt.
         user_email = email or DEFAULT_EMAIL
         user_password = password or DEFAULT_PASSWORD
-        cid = client_id or DEFAULT_CLIENT_ID
         csecret = client_secret or DEFAULT_CLIENT_SECRET
-        
-        if not user_email or not user_password:
-            logger.error("Missing email or password")
+
+        if not key:
+            logger.error("Missing API key (BITWARDEN_CLIENT_ID env var)")
             return None
-        
-        client = BitwardenCLIClient(url, user_email, user_password, cid, csecret)
-        
-        # First authenticate (login)
+
+        client = BitwardenCLIClient(url, api_key=key, email=user_email,
+                                    password=user_password, client_secret=csecret)
+
+        # First authenticate (login) — bw login --apikey, kein Master-Pwd nötig.
         if not client.authenticate():
             logger.error("Authentication failed")
             return None
-        
-        # Then unlock vault to get session key
-        if not client.unlock_vault():
-            logger.error("Vault unlock failed")
-            return None
-        
+
+        # KEIN unlock_vault() mehr nötig: bw login --apikey entschlüsselt
+        # den Vault direkt (kein Master-Pwd, keine 2FA, kein /identity/accounts/login).
+
         return client
         
     except Exception as e:
@@ -85,29 +92,29 @@ def _get_client(base_url: str = None, email: str = None, password: str = None,
 
 
 @mcp.tool()
-def search_bitwarden_items(query: str = None, item_type: str = None, 
+def search_bitwarden_items(query: str = None, item_type: str = None,
                           folder_id: str = None, limit: int = 20,
-                          base_url: str = None, email: str = None, 
-                          password: str = None, client_id: str = None, 
+                          base_url: str = None, api_key: str = None,
+                          email: str = None, password: str = None,
                           client_secret: str = None) -> str:
     """Search Bitwarden items (passwords, notes, cards, identities).
-    
+
     Args:
         query: Search term to filter items
         item_type: Filter by item type (login, note, card, identity)
         folder_id: Filter by folder ID
         limit: Maximum number of results (default: 20)
         base_url: Bitwarden server URL (defaults to BITWARDEN_BASE_URL env var)
-        email: User email (defaults to BITWARDEN_EMAIL env var)
-        password: User password (defaults to BITWARDEN_PASSWORD env var)
-        client_id: Client ID (defaults to BITWARDEN_CLIENT_ID env var)
-        client_secret: Client secret (defaults to BITWARDEN_CLIENT_SECRET env var)
-    
+        api_key: User-API-Key (defaults to BITWARDEN_CLIENT_ID env var — PREFERRED)
+        email: User email (defaults to BITWARDEN_EMAIL env var — deprecated)
+        password: User password (defaults to BITWARDEN_PASSWORD env var — deprecated)
+        client_secret: Client secret (defaults to BITWARDEN_CLIENT_SECRET env var — deprecated)
+
     Returns:
         List of matching Bitwarden items
     """
     try:
-        client = _get_client(base_url, email, password, client_id, client_secret)
+        client = _get_client(base_url, api_key, email, password, client_secret)
         if not client:
             return "❌ Authentication failed. Please check credentials."
         
@@ -171,7 +178,7 @@ def search_bitwarden_items(query: str = None, item_type: str = None,
 
 @mcp.tool()
 def get_bitwarden_item(item_id: str, base_url: str = None, email: str = None,
-                      password: str = None, client_id: str = None, 
+                      password: str = None, api_key: str = None, 
                       client_secret: str = None) -> str:
     """Get detailed information about a specific Bitwarden item.
     
@@ -180,14 +187,14 @@ def get_bitwarden_item(item_id: str, base_url: str = None, email: str = None,
         base_url: Bitwarden server URL (defaults to BITWARDEN_BASE_URL env var)
         email: User email (defaults to BITWARDEN_EMAIL env var)
         password: User password (defaults to BITWARDEN_PASSWORD env var)
-        client_id: Client ID (defaults to BITWARDEN_CLIENT_ID env var)
+        api_key: User-API-Key (defaults to BITWARDEN_CLIENT_ID env var — PREFERRED)
         client_secret: Client secret (defaults to BITWARDEN_CLIENT_SECRET env var)
     
     Returns:
         Detailed item information
     """
     try:
-        client = _get_client(base_url, email, password, client_id, client_secret)
+        client = _get_client(base_url, api_key, email, password, client_secret)
         if not client:
             return "❌ Authentication failed. Please check credentials."
         
@@ -245,7 +252,7 @@ def create_bitwarden_login(name: str, username: str, password: str,
                           uris: List[str] = None, notes: str = None,
                           folder_id: str = None, base_url: str = None,
                           email: str = None, password_param: str = None,
-                          client_id: str = None, client_secret: str = None) -> str:
+                          api_key: str = None, client_secret: str = None) -> str:
     """Create a new login item in Bitwarden.
     
     Args:
@@ -258,14 +265,14 @@ def create_bitwarden_login(name: str, username: str, password: str,
         base_url: Bitwarden server URL (defaults to BITWARDEN_BASE_URL env var)
         email: User email (defaults to BITWARDEN_EMAIL env var)
         password_param: User password (defaults to BITWARDEN_PASSWORD env var)
-        client_id: Client ID (defaults to BITWARDEN_CLIENT_ID env var)
+        api_key: User-API-Key (defaults to BITWARDEN_CLIENT_ID env var — PREFERRED)
         client_secret: Client secret (defaults to BITWARDEN_CLIENT_SECRET env var)
     
     Returns:
         Creation result message
     """
     try:
-        client = _get_client(base_url, email, password_param, client_id, client_secret)
+        client = _get_client(base_url, api_key, email, password_param, client_secret)
         if not client:
             return "❌ Authentication failed. Please check credentials."
         
@@ -290,7 +297,7 @@ def create_bitwarden_login(name: str, username: str, password: str,
 @mcp.tool()
 def create_bitwarden_note(name: str, content: str, folder_id: str = None,
                          base_url: str = None, email: str = None,
-                         password: str = None, client_id: str = None,
+                         password: str = None, api_key: str = None,
                          client_secret: str = None) -> str:
     """Create a new secure note in Bitwarden.
     
@@ -301,14 +308,14 @@ def create_bitwarden_note(name: str, content: str, folder_id: str = None,
         base_url: Bitwarden server URL (defaults to BITWARDEN_BASE_URL env var)
         email: User email (defaults to BITWARDEN_EMAIL env var)
         password: User password (defaults to BITWARDEN_PASSWORD env var)
-        client_id: Client ID (defaults to BITWARDEN_CLIENT_ID env var)
+        api_key: User-API-Key (defaults to BITWARDEN_CLIENT_ID env var — PREFERRED)
         client_secret: Client secret (defaults to BITWARDEN_CLIENT_SECRET env var)
     
     Returns:
         Creation result message
     """
     try:
-        client = _get_client(base_url, email, password, client_id, client_secret)
+        client = _get_client(base_url, api_key, email, password, client_secret)
         if not client:
             return "❌ Authentication failed. Please check credentials."
         
@@ -332,7 +339,7 @@ def update_bitwarden_item(item_id: str, name: str = None, username: str = None,
                          password: str = None, uris: List[str] = None,
                          notes: str = None, folder_id: str = None,
                          base_url: str = None, email: str = None,
-                         password_param: str = None, client_id: str = None,
+                         password_param: str = None, api_key: str = None,
                          client_secret: str = None) -> str:
     """Update an existing Bitwarden item.
     
@@ -347,14 +354,14 @@ def update_bitwarden_item(item_id: str, name: str = None, username: str = None,
         base_url: Bitwarden server URL (defaults to BITWARDEN_BASE_URL env var)
         email: User email (defaults to BITWARDEN_EMAIL env var)
         password_param: User password (defaults to BITWARDEN_PASSWORD env var)
-        client_id: Client ID (defaults to BITWARDEN_CLIENT_ID env var)
+        api_key: User-API-Key (defaults to BITWARDEN_CLIENT_ID env var — PREFERRED)
         client_secret: Client secret (defaults to BITWARDEN_CLIENT_SECRET env var)
     
     Returns:
         Update result message
     """
     try:
-        client = _get_client(base_url, email, password_param, client_id, client_secret)
+        client = _get_client(base_url, api_key, email, password_param, client_secret)
         if not client:
             return "❌ Authentication failed. Please check credentials."
         
@@ -379,7 +386,7 @@ def update_bitwarden_item(item_id: str, name: str = None, username: str = None,
 
 @mcp.tool()
 def delete_bitwarden_item(item_id: str, base_url: str = None, email: str = None,
-                         password: str = None, client_id: str = None,
+                         password: str = None, api_key: str = None,
                          client_secret: str = None) -> str:
     """Delete a Bitwarden item.
     
@@ -388,14 +395,14 @@ def delete_bitwarden_item(item_id: str, base_url: str = None, email: str = None,
         base_url: Bitwarden server URL (defaults to BITWARDEN_BASE_URL env var)
         email: User email (defaults to BITWARDEN_EMAIL env var)
         password: User password (defaults to BITWARDEN_PASSWORD env var)
-        client_id: Client ID (defaults to BITWARDEN_CLIENT_ID env var)
+        api_key: User-API-Key (defaults to BITWARDEN_CLIENT_ID env var — PREFERRED)
         client_secret: Client secret (defaults to BITWARDEN_CLIENT_SECRET env var)
     
     Returns:
         Deletion result message
     """
     try:
-        client = _get_client(base_url, email, password, client_id, client_secret)
+        client = _get_client(base_url, api_key, email, password, client_secret)
         if not client:
             return "❌ Authentication failed. Please check credentials."
         
@@ -412,7 +419,7 @@ def delete_bitwarden_item(item_id: str, base_url: str = None, email: str = None,
 
 @mcp.tool()
 def list_bitwarden_folders(base_url: str = None, email: str = None,
-                          password: str = None, client_id: str = None,
+                          password: str = None, api_key: str = None,
                           client_secret: str = None) -> str:
     """List all Bitwarden folders.
     
@@ -420,14 +427,14 @@ def list_bitwarden_folders(base_url: str = None, email: str = None,
         base_url: Bitwarden server URL (defaults to BITWARDEN_BASE_URL env var)
         email: User email (defaults to BITWARDEN_EMAIL env var)
         password: User password (defaults to BITWARDEN_PASSWORD env var)
-        client_id: Client ID (defaults to BITWARDEN_CLIENT_ID env var)
+        api_key: User-API-Key (defaults to BITWARDEN_CLIENT_ID env var — PREFERRED)
         client_secret: Client secret (defaults to BITWARDEN_CLIENT_SECRET env var)
     
     Returns:
         List of folders
     """
     try:
-        client = _get_client(base_url, email, password, client_id, client_secret)
+        client = _get_client(base_url, api_key, email, password, client_secret)
         if not client:
             return "❌ Authentication failed. Please check credentials."
         
@@ -452,7 +459,7 @@ def list_bitwarden_folders(base_url: str = None, email: str = None,
 
 @mcp.tool()
 def create_bitwarden_folder(name: str, base_url: str = None, email: str = None,
-                           password: str = None, client_id: str = None,
+                           password: str = None, api_key: str = None,
                            client_secret: str = None) -> str:
     """Create a new Bitwarden folder.
     
@@ -461,14 +468,14 @@ def create_bitwarden_folder(name: str, base_url: str = None, email: str = None,
         base_url: Bitwarden server URL (defaults to BITWARDEN_BASE_URL env var)
         email: User email (defaults to BITWARDEN_EMAIL env var)
         password: User password (defaults to BITWARDEN_PASSWORD env var)
-        client_id: Client ID (defaults to BITWARDEN_CLIENT_ID env var)
+        api_key: User-API-Key (defaults to BITWARDEN_CLIENT_ID env var — PREFERRED)
         client_secret: Client secret (defaults to BITWARDEN_CLIENT_SECRET env var)
     
     Returns:
         Creation result message
     """
     try:
-        client = _get_client(base_url, email, password, client_id, client_secret)
+        client = _get_client(base_url, api_key, email, password, client_secret)
         if not client:
             return "❌ Authentication failed. Please check credentials."
         

@@ -39,28 +39,31 @@ class BitwardenItem:
 class BitwardenCLIClient:
     """Client for Bitwarden using the bw CLI tool."""
     
-    def __init__(self, base_url: str, email: str, password: str, 
-                 client_id: str = "bitwarden-mcp-server", 
-                 client_secret: str = "bitwarden-mcp-secret"):
+    def __init__(self, base_url: str, api_key: Optional[str] = None,
+                 email: Optional[str] = None, password: Optional[str] = None,
+                 client_secret: Optional[str] = None):
         """Initialize the Bitwarden CLI client.
-        
+
         Args:
             base_url: Bitwarden/Vaultwarden server URL
-            email: User email
-            password: User password
-            client_id: Client ID for API authentication (optional)
-            client_secret: Client secret for API authentication (optional)
+            api_key: User-API-Key (Format "user.<uuid>"). Bevorzugt für bw login --apikey.
+                     Wird per BITWARDEN_CLIENT_ID env var gesetzt.
+            email: (Deprecated) User email — Legacy-Master-Pwd-Flow, nicht mehr benötigt.
+            password: (Deprecated) User master password — siehe oben.
+            client_secret: (Deprecated) Client secret — Service-User-Credentials-Flow.
         """
         self.base_url = base_url.rstrip('/')
+        self.api_key = api_key
         self.email = email
         self.password = password
-        self.client_id = client_id
         self.client_secret = client_secret
         self.session_key = None
-        
+
         # Set environment variables for bw CLI
         os.environ['BW_SERVER'] = self.base_url
-        os.environ['BW_CLIENTSECRET'] = self.client_secret
+        # Client-Secret als ENV setzen, falls vorhanden (für OAuth2-Flows)
+        if self.client_secret:
+            os.environ['BW_CLIENTSECRET'] = self.client_secret
         
     def _run_bw_command(self, command: List[str], input_data: str = None) -> Dict[str, Any]:
         """Run a bw CLI command and return the JSON response.
@@ -117,8 +120,13 @@ class BitwardenCLIClient:
             raise Exception(f"bw command failed: {str(e)}")
     
     def authenticate(self) -> bool:
-        """Authenticate with Bitwarden/Vaultwarden using bw CLI.
-        
+        """Authenticate with Bitwarden/Vaultwarden via User-API-Key (bw login --apikey).
+
+        Umgeht komplett:
+        - Master-Pwd-Flow (kein PBKDF2, keine 2FA)
+        - /identity/accounts/login Endpoint (auf Vaultwarden 404)
+        - /api/accounts/login Endpoint (gleicher Bug)
+
         Returns:
             True if authentication successful, False otherwise
         """
@@ -128,22 +136,21 @@ class BitwardenCLIClient:
                 self._run_bw_command(['logout'])
             except:
                 pass  # Ignore logout errors
-            
+
             # Configure server
             self._run_bw_command(['config', 'server', self.base_url])
-            
-            # Login using pexpect for interactive input
-            logger.debug("Starting interactive login with pexpect")
-            child = pexpect.spawn('env', ['NODE_TLS_REJECT_UNAUTHORIZED=0', 'bw', 'login', '--raw'], timeout=30)
-            
-            # Wait for email prompt and send email
-            child.expect('Email address:')
-            child.sendline(self.email)
-            
-            # Wait for password prompt and send password
-            child.expect('Master password:')
-            child.sendline(self.password)
-            
+
+            # API-Key-Login via bw login --apikey (kein Master-Pwd, kein 2FA).
+            # bw fragt interaktiv nach "API key: " und erwartet den User-API-Key.
+            logger.debug("Starting interactive apikey login with pexpect")
+            child = pexpect.spawn(
+                'env',
+                ['NODE_TLS_REJECT_UNAUTHORIZED=0', 'bw', 'login', '--apikey'],
+                timeout=30
+            )
+            child.expect('API key:')
+            child.sendline(self.api_key)
+
             # Wait for completion and get output
             child.expect(pexpect.EOF)
             output = child.before.decode('utf-8')
@@ -151,15 +158,11 @@ class BitwardenCLIClient:
 
             # DIAGNOSE-PATCH (2026-08-15): rohen bw-Output IMMER loggen, damit
             # wir beim nächsten Test exakt sehen, was bw geantwortet hat.
-            # Vorher: output wurde bei > 10 Zeichen als Session-Key interpretiert
-            # → bw-Fehlermeldungen wie "Email or password is incorrect" (35 chars)
-            #   wurden fälschlich als erfolgreicher Login geloggt.
-            logger.info(f"bw login raw output (first 500 chars): {output[:500]!r}")
+            logger.info(f"bw apikey login raw output (first 500 chars): {output[:500]!r}")
 
             # Check if we got a session key
             if output and len(output.strip()) > 10:
                 # NEU: auf bekannte bw-Fehler prüfen, BEVOR als Session-Key interpretiert.
-                # Damit verschlucken wir keine bw-Fehlermeldungen mehr als "Success".
                 error_indicators = [
                     "incorrect", "invalid", "error", "fail", "denied",
                     "not found", "two-step", "verification", "not logged in",
@@ -167,22 +170,22 @@ class BitwardenCLIClient:
                 ]
                 if any(ind in output.lower() for ind in error_indicators):
                     logger.error(
-                        f"bw login FAILED (recognized error indicator in output). "
+                        f"bw apikey login FAILED (recognized error indicator). "
                         f"Output: {output!r}"
                     )
                     return False
                 self.session_key = output.strip()
-                logger.info("Successfully authenticated with Bitwarden")
+                logger.info("Successfully authenticated via API key (bw login --apikey)")
                 return True
             else:
                 logger.error(f"Authentication failed - no session key received. Output: {output}")
                 return False
-                
+
         except pexpect.TIMEOUT:
-            logger.error("Authentication timed out")
+            logger.error("Apikey authentication timed out")
             return False
         except Exception as e:
-            logger.error(f"Authentication failed: {str(e)}")
+            logger.error(f"Apikey authentication failed: {str(e)}")
             return False
     
     def logout(self) -> bool:
@@ -276,32 +279,34 @@ class BitwardenCLIClient:
             
             # Build search command
             cmd = ['list', 'items']
-            
+
             if query:
                 cmd.extend(['--search', query])
-            
+
             if item_type:
                 type_map = {
                     'login': '1',
-                    'note': '2', 
+                    'note': '2',
                     'card': '3',
                     'identity': '4'
                 }
                 if item_type.lower() in type_map:
                     cmd.extend(['--type', type_map[item_type.lower()]])
-            
+
             if folder_id:
                 cmd.extend(['--folderid', folder_id])
-            
-            # Use pexpect for interactive password prompt
+
+            # Use --session <key> so bw doesn't ask for master password.
+            # bw is already authenticated via API key (bw login --apikey),
+            # so Vault ist entschlüsselt und kein Prompt nötig.
+            if self.session_key:
+                cmd.extend(['--session', self.session_key])
+
+            # Use pexpect for output capture
             logger.debug(f"Running bw command with pexpect: {' '.join(cmd)}")
             child = pexpect.spawn('env', ['NODE_TLS_REJECT_UNAUTHORIZED=0', 'bw'] + cmd, timeout=30)
-            
-            # Wait for password prompt and send password
-            child.expect('Master password:')
-            child.sendline(self.password)
-            
-            # Wait for completion and get output
+
+            # bw gibt JSON direkt zurück (kein Prompt) — auf EOF warten
             child.expect(pexpect.EOF)
             output = child.before.decode('utf-8')
             child.close()
