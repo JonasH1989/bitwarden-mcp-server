@@ -203,19 +203,31 @@ class BitwardenCLIClient:
                     master_password = os.getenv("BITWARDEN_PASSWORD", "")
                     if master_password:
                         try:
-                            master_key = self._derive_master_key(
+                            mk_v2, mk_v1 = self._derive_master_keys(
                                 master_password, email, kdf_iterations
                             )
+                            # Try v2 first (current Bitwarden standard)
                             self.user_key = self._decrypt_user_key(
-                                master_pw_unlock, master_key
+                                master_pw_unlock, mk_v2
                             )
+                            auth_method_used = "v2"
+                            if self.user_key is None:
+                                # Try v1 (legacy, for older accounts)
+                                logger.info("v2 decryption failed, trying v1...")
+                                self.user_key = self._decrypt_user_key(
+                                    master_pw_unlock, mk_v1
+                                )
+                                auth_method_used = "v1"
                             if self.user_key:
                                 logger.info(
-                                    f"User key derived and decrypted "
-                                    f"(email={email}, kdf_iter={kdf_iterations})"
+                                    f"User key derived and decrypted successfully "
+                                    f"(auth method: {auth_method_used}, "
+                                    f"email={email}, kdf_iter={kdf_iterations})"
                                 )
                             else:
-                                logger.error("Failed to decrypt user key")
+                                logger.error(
+                                    "Failed to decrypt user key (both v2 and v1 failed)"
+                                )
                         except Exception as e:
                             logger.error(f"Key derivation error: {e}")
                     else:
@@ -267,13 +279,16 @@ class BitwardenCLIClient:
 
     # ----- Vaultwarden encryption helpers -----
 
-    def _derive_master_key(self, password: str, email: str, kdf_iterations: int) -> bytes:
+    def _derive_master_keys(self, password: str, email: str, kdf_iterations: int):
         """Derive the master encryption key from the user's master password.
 
-        Uses Bitwarden's v2 auth flow:
+        Returns BOTH v2 and v1 master keys so we can try both:
+        - v2: HKDF(stretched, info="bitwarden-master-password-auth-v2")
+        - v1: PBKDF2(stretched, email.lower(), 1)  [legacy]
+
+        Common steps:
         1. password_hash = PBKDF2-SHA256(password, email.lower(), kdf_iterations)
         2. stretched_hash = PBKDF2-SHA256(password_hash, password_hash, 1)
-        3. master_key = HKDF-SHA256(stretched_hash, info="bitwarden-master-password-auth-v2")
         """
         password_hash = PBKDF2(
             password.encode("utf-8"),
@@ -289,14 +304,23 @@ class BitwardenCLIClient:
             count=1,
             hmac_hash_module=SHA256,
         )
-        master_key = HKDF(
+        # v2 (current): HKDF with info="bitwarden-master-password-auth-v2"
+        master_key_v2 = HKDF(
             master=stretched,
             key_len=32,
             salt=b"",
             hashmod=SHA256,
             context=b"bitwarden-master-password-auth-v2",
         )
-        return master_key
+        # v1 (legacy): PBKDF2(stretched, email.lower(), 1)
+        master_key_v1 = PBKDF2(
+            stretched,
+            email.lower().encode("utf-8"),
+            dkLen=32,
+            count=1,
+            hmac_hash_module=SHA256,
+        )
+        return master_key_v2, master_key_v1
 
     def _decrypt_enc_string(self, enc_string: str, key: bytes) -> Optional[str]:
         """Decrypt a Bitwarden encString. Format: "2.iv|ct|tag" (AES-GCM) or "0.iv|ct|mac" (AES-CBC)."""
