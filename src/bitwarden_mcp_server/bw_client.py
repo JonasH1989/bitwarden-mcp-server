@@ -179,8 +179,28 @@ class BitwardenCLIClient:
                 json={"email": email_from_token},
                 timeout=10
             )
+            # Diagnostic: log FULL prelogin response (kdf type, kdfIterations, kdfMemory, kdfParallelism)
+            try:
+                prelogin_data = prelogin_resp.json()
+                logger.info(
+                    f"prelogin response: {prelogin_data}"
+                )
+            except Exception:
+                prelogin_data = {}
             if prelogin_resp.status_code == 200:
-                kdf_iterations = prelogin_resp.json().get("kdfIterations", 600000)
+                kdf = prelogin_data.get("kdf", 0)
+                kdf_iterations = prelogin_data.get("kdfIterations", 600000)
+                kdf_memory = prelogin_data.get("kdfMemory")
+                kdf_parallelism = prelogin_data.get("kdfParallelism")
+                logger.info(
+                    f"prelogin: kdf={kdf} kdfIterations={kdf_iterations} "
+                    f"kdfMemory={kdf_memory} kdfParallelism={kdf_parallelism}"
+                )
+                if kdf != 0:
+                    logger.error(
+                        f"Unsupported KDF type: {kdf} (only 0=PBKDF2 supported). "
+                        f"User might use Argon2id (kdf=1) or another algorithm."
+                    )
             else:
                 logger.warning(f"prelogin failed ({prelogin_resp.status_code}), using default 600000")
                 kdf_iterations = 600000
@@ -290,6 +310,13 @@ class BitwardenCLIClient:
         1. password_hash = PBKDF2-SHA256(password, email.lower(), kdf_iterations)
         2. stretched_hash = PBKDF2-SHA256(password_hash, password_hash, 1)
         """
+        # Diagnostic: log what we are using (no secrets!)
+        logger.info(
+            f"Key derivation: email={email!r} "
+            f"email_lower={email.lower()!r} "
+            f"kdf_iterations={kdf_iterations} "
+            f"password_len={len(password)}"
+        )
         password_hash = PBKDF2(
             password.encode("utf-8"),
             email.lower().encode("utf-8"),
@@ -319,6 +346,13 @@ class BitwardenCLIClient:
             dkLen=32,
             count=1,
             hmac_hash_module=SHA256,
+        )
+        # Diagnostic: log derived key lengths
+        logger.info(
+            f"Derived keys: password_hash_len={len(password_hash)} "
+            f"stretched_len={len(stretched)} "
+            f"mk_v2_len={len(master_key_v2)} "
+            f"mk_v1_len={len(master_key_v1)}"
         )
         return master_key_v2, master_key_v1
 
@@ -381,17 +415,33 @@ class BitwardenCLIClient:
         Storing the full 64 bytes would cause AES.new() to reject the key
         with "Incorrect AES key length".
         """
+        # Diagnostic: log format of masterPasswordUnlock (no secret content!)
+        if master_password_unlock:
+            logger.info(
+                f"masterPasswordUnlock format: starts={master_password_unlock[:6]!r} "
+                f"len={len(master_password_unlock)} "
+                f"version={master_password_unlock.split(".")[0] if "." in master_password_unlock else "?"!r}"
+            )
         plaintext = self._decrypt_enc_string(master_password_unlock, master_key)
         if not plaintext:
+            logger.warning(
+                f"masterPasswordUnlock decryption FAILED (returned None/empty) "
+                f"with key_len={len(master_key) if master_key else 0}"
+            )
             return None
         try:
             raw = plaintext.encode("latin-1") if isinstance(plaintext, str) else plaintext
+            # Diagnostic: log decrypted plaintext length (expected 64 for user_key)
+            logger.info(
+                f"Decrypted user_key: raw_len={len(raw)} expected=64 "
+                f"first_bytes={raw[:4].hex() if len(raw) >= 4 else "too short"!r}"
+            )
             if len(raw) >= 32:
                 # Bitwarden user_key layout: [encKey 32B][macKey 32B] = 64B total
                 # AES-GCM uses encKey (first 32 bytes) for encryption
                 return raw[:32]
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"User key extraction error: {e}")
         return None
 
     def _decrypt_cipher(self, cipher: Dict, user_key: bytes) -> Dict:
