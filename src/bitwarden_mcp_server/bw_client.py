@@ -323,24 +323,45 @@ class BitwardenCLIClient:
         return master_key_v2, master_key_v1
 
     def _decrypt_enc_string(self, enc_string: str, key: bytes) -> Optional[str]:
-        """Decrypt a Bitwarden encString. Format: "2.iv|ct|tag" (AES-GCM) or "0.iv|ct|mac" (AES-CBC)."""
+        """Decrypt a Bitwarden/Vaultwarden encString.
+
+        Supports two encString formats:
+        - Bitwarden standard: "2.iv.ct" (AES-GCM, tag appended to ct)
+        - Vaultwarden:       "2.iv|ct|tag" (AES-GCM, tag is separate)
+
+        Both formats use version "2" for AES-256-GCM.
+        """
         if not enc_string or not isinstance(enc_string, str):
             return None
         try:
-            parts = enc_string.split(".", 2)
-            if len(parts) != 3:
+            if "." not in enc_string:
                 return None
-            version = parts[0]
-            iv = base64.b64decode(parts[1])
-            ciphertext_with_tag = base64.b64decode(parts[2])
-            if version == "2":  # AES-GCM (current, pycryptodome)
-                if len(ciphertext_with_tag) < 16:
+            version, rest = enc_string.split(".", 1)
+
+            # Detect format: "2.iv|ct|tag" (Vaultwarden, pipes) vs "2.iv.ct" (Bitwarden, dots)
+            if "|" in rest:
+                # Vaultwarden format: tag is a separate base64 chunk
+                parts = rest.split("|")
+                if len(parts) != 3:
                     return None
-                # Last 16 bytes are the GCM tag, rest is ciphertext
-                ciphertext = ciphertext_with_tag[:-16]
-                tag = ciphertext_with_tag[-16:]
+                iv = base64.b64decode(parts[0])
+                ct = base64.b64decode(parts[1])
+                tag = base64.b64decode(parts[2])
+            else:
+                # Bitwarden standard: tag is appended to ct (last 16 bytes)
+                sub_parts = rest.split(".")
+                if len(sub_parts) < 2:
+                    return None
+                iv = base64.b64decode(sub_parts[0])
+                ct_combined = base64.b64decode("".join(sub_parts[1:]))
+                if len(ct_combined) < 16:
+                    return None
+                ct = ct_combined[:-16]
+                tag = ct_combined[-16:]
+
+            if version == "2":  # AES-256-GCM
                 cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
-                plaintext = cipher.decrypt_and_verify(ciphertext, tag)
+                plaintext = cipher.decrypt_and_verify(ct, tag)
                 return plaintext.decode("utf-8")
             elif version == "0":  # AES-CBC-HMAC (legacy)
                 logger.warning("AES-CBC-HMAC (version 0) decryption not implemented")
