@@ -453,7 +453,7 @@ class BitwardenCLIClient:
                 try:
                     # v2: HKDF with auth-v2 info
                     password_hash = PBKDF2(
-                        master_password.encode("utf-8"),
+                        self.password.encode("utf-8"),
                         str(salt).encode("utf-8"),
                         dkLen=32,
                         count=int(kdf_iterations),
