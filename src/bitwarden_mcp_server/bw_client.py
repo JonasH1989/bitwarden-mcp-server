@@ -353,15 +353,22 @@ class BitwardenCLIClient:
             return None
 
     def _decrypt_user_key(self, master_password_unlock: str, master_key: bytes) -> Optional[bytes]:
-        """Decrypt the user encryption key from masterPasswordUnlock using master_key."""
+        """Decrypt the user encryption key (encKey) from masterPasswordUnlock.
+
+        The decrypted plaintext is the full 64-byte user_key (encKey || macKey).
+        For AES-GCM decryption we only need encKey (first 32 bytes).
+        Storing the full 64 bytes would cause AES.new() to reject the key
+        with "Incorrect AES key length".
+        """
         plaintext = self._decrypt_enc_string(master_password_unlock, master_key)
         if not plaintext:
             return None
-        # The decrypted value is the user_key (64 bytes). Try raw bytes first.
         try:
             raw = plaintext.encode("latin-1") if isinstance(plaintext, str) else plaintext
             if len(raw) >= 32:
-                return raw[:64] if len(raw) >= 64 else raw
+                # Bitwarden user_key layout: [encKey 32B][macKey 32B] = 64B total
+                # AES-GCM uses encKey (first 32 bytes) for encryption
+                return raw[:32]
         except Exception:
             pass
         return None
