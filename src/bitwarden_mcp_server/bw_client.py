@@ -622,6 +622,26 @@ class BitwardenCLIClient:
                         f"master_key_v1 first4_hex={master_key_v1[:4].hex()} "
                         f"last4_hex={master_key_v1[-4:].hex()} len={len(master_key_v1)}"
                     )
+                    # Build-5 diagnostic (2026-08-16): log encString structure
+                    # to localize AES-GCM decryption failure (format: pipes vs dots,
+                    # version prefix, first/last bytes for sanity-check).
+                    enc_str = str(enc_user_key)
+                    enc_version = enc_str.split('.')[0] if '.' in enc_str else '?'
+                    enc_has_pipes = '|' in enc_str
+                    logger.info(
+                        f"ENC_USER_KEY_DIAG: version={enc_version!r} "
+                        f"has_pipes={enc_has_pipes} total_len={len(enc_str)} "
+                        f"first8={enc_str[:8]!r} last8={enc_str[-8:]!r}"
+                    )
+                    if wrapped_user_key:
+                        wrapped_str = str(wrapped_user_key)
+                        wrapped_version = wrapped_str.split('.')[0] if '.' in wrapped_str else '?'
+                        wrapped_has_pipes = '|' in wrapped_str
+                        logger.info(
+                            f"WRAPPED_USER_KEY_DIAG: version={wrapped_version!r} "
+                            f"has_pipes={wrapped_has_pipes} total_len={len(wrapped_str)} "
+                            f"first8={wrapped_str[:8]!r} last8={wrapped_str[-8:]!r}"
+                        )
                     # Try v2 first, then v1
                     plaintext = self._decrypt_enc_string(str(enc_user_key), master_key_v2)
                     if plaintext is None:
