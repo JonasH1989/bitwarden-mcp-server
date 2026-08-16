@@ -462,20 +462,33 @@ class BitwardenCLIClient:
                     salt_format = None
 
                     # Diagnostic: log raw salt safely (first 8 + last 4 chars) to identify format
-                    salt_repr = repr(salt_raw[:60]) if isinstance(salt_raw, str) else repr(salt_raw)[:60]
                     logger.info(
                         f"Salt raw: len={len(salt_raw)} type={type(salt).__name__} "
                         f"first8={salt_raw[:8] if isinstance(salt_raw, str) else 'n/a'!r} "
                         f"last4={salt_raw[-4:] if isinstance(salt_raw, str) else 'n/a'!r}"
                     )
 
-                    if isinstance(salt_raw, bytes):
+                    # SPECIAL CASE: Vaultwarden sends the user's email address as the 'salt'
+                    # field in masterPasswordUnlock (instead of the random base64-encoded salt
+                    # that upstream Bitwarden uses). Detected: 2026-08-16 — salt = '[email protected]'
+                    # Fix: if salt looks like an email, use it directly as UTF-8 bytes.
+                    if (
+                        isinstance(salt_raw, str)
+                        and "@" in salt_raw
+                        and "." in salt_raw.split("@")[-1]
+                        and " " not in salt_raw
+                    ):
+                        salt_bytes = salt_raw.lower().encode("utf-8")
+                        salt_format = "email-as-salt"
+                        logger.info(
+                            f"Salt looks like email address — using as UTF-8 bytes: "
+                            f"{len(salt_bytes)} bytes (vaultwarden quirk)"
+                        )
+                    elif isinstance(salt_raw, bytes):
                         salt_bytes = salt_raw
                         salt_format = "bytes"
                     else:
                         # Strip chars NOT in either base64 alphabet (std or urlsafe)
-                        # std: A-Z a-z 0-9 + /
-                        # urlsafe: A-Z a-z 0-9 - _
                         cleaned = re.sub(r'[^A-Za-z0-9+/=\-_]', '', salt_raw)
                         stripped_count = len(salt_raw) - len(cleaned)
                         if stripped_count > 0:
@@ -484,7 +497,7 @@ class BitwardenCLIClient:
                                 f"(was {len(salt_raw)}, now {len(cleaned)})"
                             )
 
-                        # Try 1: standard base64 (with -_ treated as +/, validate=True)
+                        # Try 1: standard base64 (with -_ treated as +/)
                         try:
                             padded = cleaned + "=" * (-len(cleaned) % 4)
                             salt_bytes = base64.b64decode(padded, altchars=b'-_')
@@ -494,7 +507,7 @@ class BitwardenCLIClient:
                                 f"(from {len(cleaned)} cleaned chars)"
                             )
                         except Exception as e_std:
-                            # Try 2: URL-safe base64 (validate=False to be lenient)
+                            # Try 2: URL-safe base64
                             try:
                                 padded = cleaned + "=" * (-len(cleaned) % 4)
                                 salt_bytes = base64.urlsafe_b64decode(padded)
