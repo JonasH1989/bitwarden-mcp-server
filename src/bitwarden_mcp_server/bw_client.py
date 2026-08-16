@@ -642,6 +642,45 @@ class BitwardenCLIClient:
                             f"has_pipes={wrapped_has_pipes} total_len={len(wrapped_str)} "
                             f"first8={wrapped_str[:8]!r} last8={wrapped_str[-8:]!r}"
                         )
+                    # Build-6 diagnostic (2026-08-16): test alternative salt encodings
+                    # AND alternative HKDF context-strings, to find which combination
+                    # produces the correct master_key (decrypt-and-verify of enc_user_key).
+                    import hashlib as _hashlib_diag
+                    _salt_current = salt_bytes
+                    _salt_sha256 = _hashlib_diag.sha256(_salt_current).digest()
+                    _salt_padded = _salt_current + b"\x00" * (32 - len(_salt_current))
+                    _salt_variants = [
+                        ("current-email-utf8", _salt_current),
+                        ("sha256-of-email", _salt_sha256),
+                        ("email-padded-32", _salt_padded),
+                    ]
+                    _ctx_variants = [
+                        b"bitwarden-master-password-auth-v2",
+                        b"vaultwarden-master-password-auth-v2",
+                    ]
+                    for _salt_name, _salt_var in _salt_variants:
+                        for _ctx in _ctx_variants:
+                            try:
+                                _ph = PBKDF2(
+                                    self.password.encode("utf-8"), _salt_var,
+                                    dkLen=32, count=int(kdf_iterations),
+                                    hmac_hash_module=SHA256,
+                                )
+                                _st = PBKDF2(_ph, _ph, dkLen=32, count=1, hmac_hash_module=SHA256)
+                                _mk = HKDF(
+                                    master=_st, key_len=32, salt=b"",
+                                    hashmod=SHA256, context=_ctx,
+                                )
+                                logger.info(
+                                    f"SALT_DIAG: salt={_salt_name:20} "
+                                    f"ctx={_ctx.decode():35} "
+                                    f"mk_first4={_mk[:4].hex()} mk_last4={_mk[-4:].hex()}"
+                                )
+                            except Exception as _e:
+                                logger.warning(
+                                    f"SALT_DIAG: salt={_salt_name} "
+                                    f"ctx={_ctx.decode()!r} error={_e}"
+                                )
                     # Try v2 first, then v1
                     plaintext = self._decrypt_enc_string(str(enc_user_key), master_key_v2)
                     if plaintext is None:
