@@ -193,8 +193,9 @@ class BitwardenCLIClient:
                 kdf_memory = prelogin_data.get("kdfMemory")
                 kdf_parallelism = prelogin_data.get("kdfParallelism")
                 logger.info(
-                    f"prelogin: kdf={kdf} kdfIterations={kdf_iterations} "
-                    f"kdfMemory={kdf_memory} kdfParallelism={kdf_parallelism}"
+                    f"PRELOGIN_KDF: type={kdf} iterations={kdf_iterations} "
+                    f"kdfMemory={kdf_memory} kdfParallelism={kdf_parallelism} "
+                    f"(source: /identity/accounts/prelogin — current server-policy iterations)"
                 )
                 if kdf != 0:
                     logger.error(
@@ -443,8 +444,9 @@ class BitwardenCLIClient:
                 enc_user_key = master_password_unlock.get("masterKeyEncryptedUserKey", "")
                 wrapped_user_key = master_password_unlock.get("masterKeyWrappedUserKey", "")
                 logger.info(
-                    f"KDF config: type={kdf_type} iterations={kdf_iterations} "
-                    f"salt_len={len(str(salt))} enc_user_key_len={len(str(enc_user_key))}"
+                    f"MASTER_PW_UNLOCK_KDF: type={kdf_type} iterations={kdf_iterations} "
+                    f"salt_len={len(str(salt))} enc_user_key_len={len(str(enc_user_key))} "
+                    f"(source: masterPasswordUnlock.kdf — account-creation iterations)"
                 )
                 # Derive master_key using the explicit salt (NOT email)
                 if not salt or not enc_user_key or not master_key:
@@ -567,6 +569,19 @@ class BitwardenCLIClient:
                             f"Format={salt_format}"
                         )
 
+                    # Build-4 diagnostic (2026-08-16): log password properties to confirm
+                    # env-var content byte-exact (no plaintext, just first4/last4 hex + lengths).
+                    if self.password:
+                        pwd_bytes = self.password.encode("utf-8")
+                        logger.info(
+                            f"PASSWORD_PROPERTIES: len_chars={len(self.password)} "
+                            f"len_utf8_bytes={len(pwd_bytes)} "
+                            f"first4_hex={pwd_bytes[:4].hex()} "
+                            f"last4_hex={pwd_bytes[-4:].hex()}"
+                        )
+                    else:
+                        logger.error("PASSWORD_PROPERTIES: self.password is EMPTY!")
+
                     # v2: HKDF with auth-v2 info
                     password_hash = PBKDF2(
                         self.password.encode("utf-8"),
@@ -597,6 +612,15 @@ class BitwardenCLIClient:
                         dkLen=32,
                         count=1,
                         hmac_hash_module=SHA256,
+                    )
+                    # Build-4 diagnostic (2026-08-16): log derived master-key fingerprints.
+                    # If these are non-zero and identical between v2/v1 paths but MAC still fails,
+                    # the bug is downstream (encString format / AES-GCM params).
+                    logger.info(
+                        f"DERIVED_KEYS: master_key_v2 first4_hex={master_key_v2[:4].hex()} "
+                        f"last4_hex={master_key_v2[-4:].hex()} len={len(master_key_v2)} | "
+                        f"master_key_v1 first4_hex={master_key_v1[:4].hex()} "
+                        f"last4_hex={master_key_v1[-4:].hex()} len={len(master_key_v1)}"
                     )
                     # Try v2 first, then v1
                     plaintext = self._decrypt_enc_string(str(enc_user_key), master_key_v2)
