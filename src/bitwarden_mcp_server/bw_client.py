@@ -681,7 +681,55 @@ class BitwardenCLIClient:
                                     f"SALT_DIAG: salt={_salt_name} "
                                     f"ctx={_ctx.decode()!r} error={_e}"
                                 )
-                    # Try v2 first, then v1
+                    # Build-7 diagnostic (2026-08-16): try actual decryption with each of
+                    # the 6 salt+ctx combinations (build-6 only logged fingerprints, this
+                    # actually attempts decrypt_and_verify to find which is correct).
+                    import hashlib as _h7
+                    _salts7 = [
+                        ("current-email-utf8", salt_bytes),
+                        ("sha256-of-email", _h7.sha256(salt_bytes).digest()),
+                        ("email-padded-32", salt_bytes + b"\x00" * (32 - len(salt_bytes))),
+                    ]
+                    _ctxs7 = [
+                        ("bitwarden-master-password-auth-v2", b"bitwarden-master-password-auth-v2"),
+                        ("vaultwarden-master-password-auth-v2", b"vaultwarden-master-password-auth-v2"),
+                    ]
+                    _enc7 = str(enc_user_key)
+                    _ok7 = False
+                    for _sn, _sv in _salts7:
+                        if _ok7:
+                            break
+                        for _cn, _cv in _ctxs7:
+                            try:
+                                _ph7 = PBKDF2(
+                                    self.password.encode("utf-8"), _sv,
+                                    dkLen=32, count=int(kdf_iterations),
+                                    hmac_hash_module=SHA256,
+                                )
+                                _st7 = PBKDF2(_ph7, _ph7, dkLen=32, count=1, hmac_hash_module=SHA256)
+                                _mk7 = HKDF(
+                                    master=_st7, key_len=32, salt=b"",
+                                    hashmod=SHA256, context=_cv,
+                                )
+                                _pt7 = self._decrypt_enc_string(_enc7, _mk7)
+                                if _pt7 is not None:
+                                    _rw7 = _pt7.encode("latin-1") if isinstance(_pt7, str) else _pt7
+                                    logger.info(
+                                        f"DECRYPT_SUCCESS: salt={_sn} ctx={_cn} "
+                                        f"raw_len={len(_rw7)}"
+                                    )
+                                    _ok7 = True
+                                    break
+                            except Exception as _e7:
+                                logger.warning(
+                                    f"DECRYPT_TRY: salt={_sn} ctx={_cn} error={_e7}"
+                                )
+                    if not _ok7:
+                        logger.error(
+                            "ALL_SALT_CTX_FAILED: none of the 6 (salt, ctx) "
+                            "combinations decrypted enc_user_key"
+                        )
+                    # Try v2 first, then v1 (existing code path)
                     plaintext = self._decrypt_enc_string(str(enc_user_key), master_key_v2)
                     if plaintext is None:
                         logger.info("v2 failed, trying v1...")
