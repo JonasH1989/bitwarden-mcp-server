@@ -451,29 +451,65 @@ class BitwardenCLIClient:
                     logger.error("Missing salt, enc_user_key, or master_key")
                     return None
                 try:
-                    # Decode salt — try base64 first, fall back to raw bytes
-                    # The salt field in new Bitwarden format may be:
-                    #  - base64-encoded (standard)
-                    #  - raw bytes (some Vaultwarden versions)
-                    #  - hex-encoded
+                    # Decode salt — Vaultwarden uses different encodings depending on version:
+                    #  - Standard base64 (with padding)
+                    #  - URL-safe base64 (uses -_ chars, may lack padding) ← this is the issue!
+                    #  - Hex
+                    #  - Raw UTF-8 (last-resort fallback)
+                    # Symptom of bug: "17 data characters cannot be 1 more than a multiple of 4"
+                    # = std b64decode discards -_ chars (URL-safe alphabet) → wrong length → fail
                     salt_raw = salt if isinstance(salt, str) else str(salt)
                     salt_bytes = None
+                    salt_format = None
                     if isinstance(salt_raw, bytes):
                         salt_bytes = salt_raw
+                        salt_format = "bytes"
                         logger.info(f"Salt is bytes (len={len(salt_bytes)})")
                     else:
-                        # Try base64 first (with padding fix)
+                        # Try 1: standard base64 (with padding fix)
                         try:
-                            # Add padding if missing (base64 requires len % 4 == 0)
                             padded = salt_raw + "=" * (-len(salt_raw) % 4)
                             salt_bytes = base64.b64decode(padded, validate=False)
-                            logger.info(f"Salt base64-decoded: {len(salt_bytes)} bytes (from {len(salt_raw)} chars)")
-                        except Exception as e:
-                            # Fall back to raw bytes
-                            salt_bytes = salt_raw.encode("utf-8") if isinstance(salt_raw, str) else salt_raw
-                            logger.warning(
-                                f"base64 decode failed ({e}), using raw salt as bytes: {len(salt_bytes)} bytes"
+                            salt_format = "std-base64"
+                            logger.info(
+                                f"Salt decoded (std-base64): {len(salt_bytes)} bytes "
+                                f"(from {len(salt_raw)} chars)"
                             )
+                        except Exception as e_std:
+                            # Try 2: URL-safe base64 (Vaultwarden often uses -_ chars)
+                            try:
+                                padded = salt_raw + "=" * (-len(salt_raw) % 4)
+                                salt_bytes = base64.urlsafe_b64decode(padded)
+                                salt_format = "urlsafe-base64"
+                                logger.info(
+                                    f"Salt decoded (urlsafe-base64): {len(salt_bytes)} bytes "
+                                    f"(from {len(salt_raw)} chars)"
+                                )
+                            except Exception as e_url:
+                                # Try 3: hex (some Vaultwarden versions)
+                                try:
+                                    salt_bytes = bytes.fromhex(salt_raw)
+                                    salt_format = "hex"
+                                    logger.info(
+                                        f"Salt decoded (hex): {len(salt_bytes)} bytes "
+                                        f"(from {len(salt_raw)} chars)"
+                                    )
+                                except Exception as e_hex:
+                                    # Last resort: raw UTF-8 bytes (likely wrong but won't crash)
+                                    salt_bytes = salt_raw.encode("utf-8")
+                                    salt_format = "raw-utf8"
+                                    logger.warning(
+                                        f"All salt decodes failed. std={type(e_std).__name__}, "
+                                        f"urlsafe={type(e_url).__name__}, hex={type(e_hex).__name__}. "
+                                        f"Using raw UTF-8 as fallback: {len(salt_bytes)} bytes — "
+                                        f"decryption will likely fail (MAC check)"
+                                    )
+                    # Sanity: Bitwarden salts are typically 32 bytes; flag if way off
+                    if salt_format and salt_bytes is not None and len(salt_bytes) < 16:
+                        logger.warning(
+                            f"Salt is only {len(salt_bytes)} bytes — Bitwarden expects 32. "
+                            f"Format={salt_format}, source={salt_raw[:40]!r}"
+                        )
 
                     # v2: HKDF with auth-v2 info
                     password_hash = PBKDF2(
