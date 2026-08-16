@@ -468,23 +468,45 @@ class BitwardenCLIClient:
                         f"last4={salt_raw[-4:] if isinstance(salt_raw, str) else 'n/a'!r}"
                     )
 
-                    # SPECIAL CASE: Vaultwarden sends an email-shaped value in the 'salt' field,
-                    # but its local part may differ from self.user_email (Bug 2026-08-16:
-                    # salt first8='usta.ai@' but user_email is something else).
-                    # Fix: detect email-shaped salt, but use self.user_email.lower() (the actual
-                    # configured user email) for PBKDF2 — same salt that legacy v1 derivation uses.
+                    # SPECIAL CASE: Vaultwarden sends an email-shaped value in the 'salt' field.
+                    # Fix (build_iter3, 2026-08-16): Trust Vaultwarden's salt field directly.
+                    # Do NOT derive salt from self.user_email, because profile.email (which is
+                    # what self.user_email is set to from /api/sync) may differ from the original
+                    # account-creation email that Vaultwarden used to compute the PBKDF2 salt.
+                    #
+                    # Bug history for this branch:
+                    #   - bf9516c: tried salt_raw.lower().encode() → still MAC fail (wrong salt)
+                    #   - a6dec16: tried self.user_email.lower()   → still MAC fail (profile.email ≠ salt)
+                    #   - build_iter3: use salt_raw.encode("utf-8") directly + diagnostic compare-log
                     if (
                         isinstance(salt_raw, str)
                         and "@" in salt_raw
                         and "." in salt_raw.split("@")[-1]
                         and " " not in salt_raw
                     ):
-                        salt_bytes = self.user_email.lower().encode("utf-8")
+                        salt_bytes = salt_raw.encode("utf-8")
                         salt_format = "user-email-vaultwarden-quirk"
+                        # Diagnostic: log salt_bytes hex + self.user_email.lower() first8/last4
+                        # + match-status. If MISMATCH, profile.email diverged from salt.
+                        user_email_lower = (self.user_email or "").lower()
+                        if user_email_lower:
+                            em_match = (
+                                "MATCH" if user_email_lower.encode("utf-8") == salt_bytes
+                                else "MISMATCH"
+                            )
+                            em_diag = (
+                                f"first8={user_email_lower[:8]!r} "
+                                f"last4={user_email_lower[-4:]!r} "
+                                f"len={len(user_email_lower)}"
+                            )
+                        else:
+                            em_match = "N/A"
+                            em_diag = "<NONE>"
                         logger.info(
-                            f"Salt field is email-shaped — using self.user_email.lower() as "
-                            f"PBKDF2 salt: {len(salt_bytes)} bytes "
-                            f"(vaultwarden salt field local-part may differ from user email)"
+                            f"Salt field is email-shaped — using salt_raw.encode() as PBKDF2 salt: "
+                            f"{len(salt_bytes)} bytes "
+                            f"(salt_hex={salt_bytes[:4].hex()}-{salt_bytes[-2:].hex()}, "
+                            f"self.user_email=({em_diag}, {em_match}))"
                         )
                     elif isinstance(salt_raw, bytes):
                         salt_bytes = salt_raw
