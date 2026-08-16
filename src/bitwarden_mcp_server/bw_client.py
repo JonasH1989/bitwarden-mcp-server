@@ -468,21 +468,23 @@ class BitwardenCLIClient:
                         f"last4={salt_raw[-4:] if isinstance(salt_raw, str) else 'n/a'!r}"
                     )
 
-                    # SPECIAL CASE: Vaultwarden sends the user's email address as the 'salt'
-                    # field in masterPasswordUnlock (instead of the random base64-encoded salt
-                    # that upstream Bitwarden uses). Detected: 2026-08-16 — salt = '[email protected]'
-                    # Fix: if salt looks like an email, use it directly as UTF-8 bytes.
+                    # SPECIAL CASE: Vaultwarden sends an email-shaped value in the 'salt' field,
+                    # but its local part may differ from self.user_email (Bug 2026-08-16:
+                    # salt first8='usta.ai@' but user_email is something else).
+                    # Fix: detect email-shaped salt, but use self.user_email.lower() (the actual
+                    # configured user email) for PBKDF2 — same salt that legacy v1 derivation uses.
                     if (
                         isinstance(salt_raw, str)
                         and "@" in salt_raw
                         and "." in salt_raw.split("@")[-1]
                         and " " not in salt_raw
                     ):
-                        salt_bytes = salt_raw.lower().encode("utf-8")
-                        salt_format = "email-as-salt"
+                        salt_bytes = self.user_email.lower().encode("utf-8")
+                        salt_format = "user-email-vaultwarden-quirk"
                         logger.info(
-                            f"Salt looks like email address — using as UTF-8 bytes: "
-                            f"{len(salt_bytes)} bytes (vaultwarden quirk)"
+                            f"Salt field is email-shaped — using self.user_email.lower() as "
+                            f"PBKDF2 salt: {len(salt_bytes)} bytes "
+                            f"(vaultwarden salt field local-part may differ from user email)"
                         )
                     elif isinstance(salt_raw, bytes):
                         salt_bytes = salt_raw
